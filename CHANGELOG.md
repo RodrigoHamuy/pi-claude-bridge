@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Add: isolated compression fork for background compaction** — Serve a `claude-bridge:isolated-fork` request on `pi.events` so a compression extension (billion-context-pi `compress.async`) can have the model pick and summarize a range while the main turn runs. The bridge rebuilds the context it last served for that session into a throwaway Claude Code session, runs it with the main query's options and tool definitions, refuses every tool call, returns the first call to the requested tool, and deletes the session; the main session's mirror, query and transcript are untouched. Prompt-cache reuse against the main session is not measured. Covered by `tests/unit-isolated-fork.mjs` and a contract in `tests/int-cc-contracts.mjs`.
 - **Fix: system prompt sections survive prompt capture (issue #153)** — pi 0.99.2+ adds an `mcp_servers` section through its MCP extension. The transcript replay now ranks unlisted sections after the built-ins, matching pi's builder, so the capture key matches instead of failing every turn; and recorded sections are projected to Claude Code instead of being silently dropped. The failure message points at a section-order divergence instead of blaming extension load order.
 - **Fix: duplicate AGENTS.md instructions (#151)** — Exclude Claude Code's native copy, matching the existing CLAUDE.md exclusions.
 

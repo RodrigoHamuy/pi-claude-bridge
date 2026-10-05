@@ -5,6 +5,7 @@ import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@a
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { spawn, type ChildProcess } from "child_process";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -22,12 +23,13 @@ import {
 	sharedPromptCaptures,
 	type PromptCapture,
 } from "./prompt-capture.js";
-import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
+import { collectCarriedAttachments, placeCarriedAttachments, promptsOf, recordPromptTexts, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
+import { ForkRefused, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, type ForkProcess, type ServedRequest } from "./isolated-fork.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -347,7 +349,7 @@ function convertAndImportMessages(
 	messages: Context["messages"],
 	customToolNameToSdk?: Map<string, string>,
 	carried?: readonly CarriedAttachment[],
-): void {
+): { skippedAttachments: string[]; promptTexts: string[] } {
 	const { anthropicMessages, sanitizedIds, dropped } = convertPiMessages(messages, customToolNameToSdk);
 
 	debug(`convertAndImportMessages: ${messages.length} pi msgs → ${anthropicMessages.length} anthropic msgs`);
@@ -391,6 +393,10 @@ function convertAndImportMessages(
 	if (repaired.length) {
 		session.importMessages(repaired, placed?.attachments.length ? { attachments: placed.attachments } : undefined);
 	}
+	return {
+		skippedAttachments: placed?.skipped ?? [],
+		promptTexts: promptsOf(repaired as unknown as { role: string; content: unknown }[]).map((p) => p.text),
+	};
 }
 
 // Pi doesn't pass tool results directly — it appends them to the context and calls
@@ -862,6 +868,11 @@ let queryImpl: typeof query = query;
 
 // @internal
 export const __test = {
+	get servedRequests() { return servedRequests; },
+	get isolatedForks() { return isolatedForks; },
+	setProviderSettings(settings: NonNullable<Config["provider"]>) {
+		providerSettings = settings;
+	},
 	setQuery(fn: typeof query | null) {
 		queryImpl = fn ?? query;
 	},
@@ -1702,6 +1713,222 @@ function discardRewrittenQuery(c: QueryContext): void {
 	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
 }
 
+function systemPromptAppendFor(systemPrompt: string | undefined, mcpTools: Tool[]): {
+	promptCapture: ReturnType<typeof promptCaptures.resolveOrDerive>;
+	systemPromptAppend: string | undefined;
+} {
+	const promptCapture = promptCaptures.resolveOrDerive(systemPrompt);
+	const systemPromptAppend = promptCapture
+		? projectPromptCapture(promptCapture, {
+			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
+		})
+		: undefined;
+	return { promptCapture, systemPromptAppend };
+}
+
+const FORK_TOOL_REFUSAL = "Tool execution is disabled in this compression fork.";
+
+// Every pi session's last provider call, and the forks started from them. See
+// isolated-fork.ts: the fork rebuilds the recorded context into its own CC
+// session and runs it with the same options and tool definitions as the main
+// query, refusing every tool call.
+const servedRequests = new ServedRequests();
+const isolatedForks = new IsolatedForks(servedRequests, {
+	// Without --strict-mcp-config CC loads filesystem MCP servers whose handlers are
+	// not the fork's refusing proxies, and bypassPermissions would let them run.
+	refusal: () => (providerSettings.strictMcpConfig === false ? "unsafe-config" : undefined),
+	createSession(served: ServedRequest): string {
+		const { customToolNameToSdk } = resolveMcpTools(served.context, askClaudeToolName);
+		const source = readForkSource(served);
+		const session = createSession({
+			projectPath: served.cwd,
+			claudeDir: process.env.CLAUDE_CONFIG_DIR,
+			model: claudeCodeModelId(served.model, longContextSettings),
+		});
+		const imported = convertAndImportMessages(session, nonSystemMessages(served.context.messages), customToolNameToSdk, source.carried);
+		// A fork missing an @file expansion the main session has would summarize a
+		// conversation the model never saw. Nothing is on disk before save().
+		const last = imported.promptTexts.length - 1;
+		if (imported.skippedAttachments.length || (last >= 0 && source.promptTexts[last] !== imported.promptTexts[last])) {
+			throw new ForkRefused("unsupported-context");
+		}
+		session.save();
+		verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, served.cwd);
+		return session.sessionId;
+	},
+	startQuery(served, sessionId, prompt, abortController) {
+		const { mcpTools } = resolveMcpTools(served.context, askClaudeToolName);
+		const { systemPromptAppend } = systemPromptAppendFor(served.context.systemPrompt, mcpTools);
+		const mcpServers = mcpTools.length
+			? {
+				[MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, mcpTools.map((tool) => ({
+					name: tool.name,
+					description: tool.description,
+					inputSchema: tool.parameters,
+					handler: async (toolCallId: string): Promise<McpResult> => ({
+						toolCallId,
+						isError: true,
+						content: [{ type: "text", text: FORK_TOOL_REFUSAL }],
+					}),
+				}))),
+			}
+			: undefined;
+		const { queryOptions } = providerQueryOptions({
+			model: served.model,
+			reasoning: served.reasoning,
+			cliModel: claudeCodeModelId(served.model, longContextSettings),
+			cwd: served.cwd,
+			systemPromptAppend,
+			mcpServers,
+			resume: sessionId,
+			debugTag: "isolated-fork",
+		});
+		const watched = watchedSpawn();
+		const forkQuery = queryImpl({ prompt, options: { ...queryOptions, abortController, maxTurns: 2, spawnClaudeCodeProcess: watched.spawn } });
+		return { query: forkQuery, process: watched.process };
+	},
+	sdkToolName: (piToolName) => `${MCP_TOOL_PREFIX}${piToolName}`,
+	deleteSession: (sessionId, cwd) => deleteSession(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR),
+	debug,
+});
+
+/** The main session's @file expansions and prompt sequence, read strictly: a
+ *  transcript that cannot be read refuses the fork rather than dropping files. */
+function readForkSource(served: ServedRequest): { carried: CarriedAttachment[]; promptTexts: string[] } {
+	const state = sessionStateFor(served.piSessionId);
+	if (!state) throw new ForkRefused("unsupported-context");
+	try {
+		const { records } = openSession({ sessionId: state.sessionId, projectPath: served.cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		return { carried: collectCarriedAttachments(records), promptTexts: recordPromptTexts(records) };
+	} catch {
+		throw new ForkRefused("unsupported-context");
+	}
+}
+
+const FORK_KILL_AFTER_MS = 10_000;
+
+/** A spawner that reports when the fork's CC process has exited — the SDK's own
+ *  close() returns before that — and refuses to start one after close. */
+function watchedSpawn(): { spawn: NonNullable<NonNullable<Parameters<typeof query>[0]["options"]>["spawnClaudeCodeProcess"]>; process: ForkProcess } {
+	let child: ChildProcess | undefined;
+	let closed = false;
+	let exit!: () => void;
+	const exited = new Promise<void>((resolve) => { exit = resolve; });
+	return {
+		spawn(options) {
+			if (closed) throw new Error("isolated fork closed before its process started");
+			const proc = spawn(options.command, options.args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+			child = proc;
+			proc.once("exit", () => exit());
+			proc.once("error", () => { if (proc.pid === undefined) exit(); });
+			options.signal.addEventListener("abort", () => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGTERM"); }, { once: true });
+			return proc as unknown as ReturnType<NonNullable<NonNullable<Parameters<typeof query>[0]["options"]>["spawnClaudeCodeProcess"]>>;
+		},
+		process: {
+			exited,
+			close() {
+				closed = true;
+				const proc = child;
+				if (!proc) {
+					exit();
+					return;
+				}
+				if (proc.exitCode !== null || proc.signalCode !== null) return;
+				const timer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, FORK_KILL_AFTER_MS);
+				timer.unref();
+				proc.once("exit", () => clearTimeout(timer));
+			},
+		},
+	};
+}
+
+/** Query options every provider-path CC process shares: the main query and the
+ *  isolated compression fork must send the same preset, settings and tools. */
+function providerQueryOptions(args: {
+	model: Model<any>;
+	reasoning: SimpleStreamOptions["reasoning"];
+	cliModel: string;
+	cwd: string;
+	systemPromptAppend: string | undefined;
+	mcpServers: Record<string, ReturnType<typeof createToolServer>> | undefined;
+	resume: string | null | undefined;
+	debugTag: string;
+}): { queryOptions: NonNullable<Parameters<typeof query>[0]["options"]>; effort: EffortLevel | undefined; strictMcpConfigEnabled: boolean } {
+	const { model, reasoning, cliModel, cwd, systemPromptAppend, mcpServers, resume, debugTag } = args;
+	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
+	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
+	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
+	// programmatically and ignore filesystem MCP entries — applied unconditionally because
+	// settingSources is left at CC's default, which loads all sources.
+	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
+	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
+
+	// Prefer the model's own thinkingLevelMap (per-model overrides — e.g. a map can
+	// route xhigh→xhigh where the generic table maps xhigh→max). pi-ai's catalog
+	// ships a map for most Claude models; the table below covers models without
+	// one, and the levels a map leaves unnamed. A null entry means the level is
+	// unsupported on that model: no effort argument is sent, so Claude Code's own
+	// default applies rather than the generic table's value. Map values are
+	// provider-generic strings, so a map value is trusted only when it names a
+	// level CC accepts.
+	const mapped = reasoning ? model.thinkingLevelMap?.[reasoning] : undefined;
+	const effort = reasoning
+		? mapped === undefined
+			? REASONING_TO_EFFORT[reasoning]
+			: VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined
+		: undefined;
+
+	const extraArgs: Record<string, string | null> = { model: cliModel };
+	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
+	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
+	// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
+	if (effort) extraArgs["thinking-display"] = "summarized";
+
+	// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
+	// when the user is logged into Anthropic). These are a separate code path from
+	// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
+	// The native CC binary gates them on env var ENABLE_CLAUDEAI_MCP_SERVERS: setting it
+	// to "0"/"false"/"no"/"off" makes the loader return early before any cloud fetch.
+	// DISABLE_AUTO_COMPACT=1: pi owns context-management and propagates its own
+	// /compact via session_compact (see handler in default export). Letting CC
+	// also autocompact would double-flush the prompt cache and races pi's
+	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
+	// Manual /compact in CC still works (we never invoke it).
+	const childEnv = { ...process.env, ...CC_CHILD_ENV };
+	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
+		cwd,
+		env: childEnv,
+		tools: [],
+		permissionMode: "bypassPermissions",
+		includePartialMessages: true,
+		// includeGitInstructions:false drops the gitStatus block from the preset.
+		// That block is the trailing suffix of the cached system block, and a
+		// git-state transition (new file, staging, commit) rewrites it — busting
+		// the prompt cache for the whole conversation from there on (see
+		// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
+		// hit on every transition. Cost here is nil: the setting also strips
+		// CC's git-workflow guidance from its Bash tool prompt, but the provider
+		// path runs CC with `tools: []`, so those definitions never ship.
+		// AskClaude keeps CC's native tools and its guidance — unaffected.
+		settings: {
+			...claudeCodeSettings(providerSettings),
+			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
+			includeGitInstructions: false,
+		},
+		systemPrompt: {
+			type: "preset", preset: "claude_code",
+			append: systemPromptAppend ? systemPromptAppend : undefined,
+		},
+		extraArgs,
+		...(effort ? { effort } : {}),
+		...(mcpServers ? { mcpServers } : {}),
+		...(resume ? { resume } : {}),
+		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+		...makeCliDebugOptions(debugTag),
+	};
+	return { queryOptions, effort, strictMcpConfigEnabled };
+}
+
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -1720,6 +1947,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (options?.cacheRetention === "none") {
 		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
 		return isolatedStreamFn(model, context, options);
+	}
+	if (!servedRequests.record(options?.sessionId, model, context, options?.reasoning, process.cwd())) {
+		debug("isolated-fork: request could not be copied; this session has no fork source until the next one");
 	}
 
 	const stream = createAssistantMessageEventStream();
@@ -1831,12 +2061,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let promptCapture: PromptCapture | undefined;
 	let systemPromptAppend: string | undefined;
 	try {
-		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
-		systemPromptAppend = promptCapture
-			? projectPromptCapture(promptCapture, {
-				skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
-			})
-			: undefined;
+		({ promptCapture, systemPromptAppend } = systemPromptAppendFor(context.systemPrompt, mcpTools));
 	} catch (err) {
 		// resolveOrDerive and projectPromptCapture throw to stop a turn that would lose
 		// its instructions or leak pi's harness text. Report it on the stream, as pi-ai's
@@ -1930,77 +2155,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.promptStream = promptStream;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
 
-	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
-	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
-	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
-	// programmatically and ignore filesystem MCP entries — applied unconditionally because
-	// settingSources is left at CC's default, which loads all sources.
-	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
-	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
-
-	// Prefer the model's own thinkingLevelMap (per-model overrides — e.g. a map can
-	// route xhigh→xhigh where the generic table maps xhigh→max). pi-ai's catalog
-	// ships a map for most Claude models; the table below covers models without
-	// one, and the levels a map leaves unnamed. A null entry means the level is
-	// unsupported on that model: no effort argument is sent, so Claude Code's own
-	// default applies rather than the generic table's value. Map values are
-	// provider-generic strings, so a map value is trusted only when it names a
-	// level CC accepts.
-	const mapped = options?.reasoning ? model.thinkingLevelMap?.[options.reasoning] : undefined;
-	const effort = options?.reasoning
-		? mapped === undefined
-			? REASONING_TO_EFFORT[options.reasoning]
-			: VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined
-		: undefined;
-
-	const extraArgs: Record<string, string | null> = { model: cliModel };
-	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
-	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
-	// Force summarized so thinking_delta events arrive. See anthropics/claude-agent-sdk-python#830.
-	if (effort) extraArgs["thinking-display"] = "summarized";
-
-	// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
-	// when the user is logged into Anthropic). These are a separate code path from
-	// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
-	// The native CC binary gates them on env var ENABLE_CLAUDEAI_MCP_SERVERS: setting it
-	// to "0"/"false"/"no"/"off" makes the loader return early before any cloud fetch.
-	// DISABLE_AUTO_COMPACT=1: pi owns context-management and propagates its own
-	// /compact via session_compact (see handler in default export). Letting CC
-	// also autocompact would double-flush the prompt cache and races pi's
-	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
-	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV };
-	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
-		cwd,
-		env: childEnv,
-		tools: [],
-		permissionMode: "bypassPermissions",
-		includePartialMessages: true,
-		// includeGitInstructions:false drops the gitStatus block from the preset.
-		// That block is the trailing suffix of the cached system block, and a
-		// git-state transition (new file, staging, commit) rewrites it — busting
-		// the prompt cache for the whole conversation from there on (see
-		// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
-		// hit on every transition. Cost here is nil: the setting also strips
-		// CC's git-workflow guidance from its Bash tool prompt, but the provider
-		// path runs CC with `tools: []`, so those definitions never ship.
-		// AskClaude keeps CC's native tools and its guidance — unaffected.
-		settings: {
-			...claudeCodeSettings(providerSettings),
-			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
-			includeGitInstructions: false,
-		},
-		systemPrompt: {
-			type: "preset", preset: "claude_code",
-			append: systemPromptAppend ? systemPromptAppend : undefined,
-		},
-		extraArgs,
-		...(effort ? { effort } : {}),
-		...(mcpServers ? { mcpServers } : {}),
-		...(resumeSessionId ? { resume: resumeSessionId } : {}),
-		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-		...makeCliDebugOptions("provider"),
-	};
+	const { queryOptions, effort, strictMcpConfigEnabled } = providerQueryOptions({
+		model, reasoning: options?.reasoning, cliModel, cwd, systemPromptAppend, mcpServers, resume: resumeSessionId, debugTag: "provider",
+	});
 
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
@@ -2355,6 +2512,7 @@ let askClaudeToolName = "AskClaude";
 export default function (pi: ExtensionAPI) {
 	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+	pi.events.on(ISOLATED_FORK_CHANNEL, (data) => isolatedForks.handle(data));
 
 	const config = loadConfig(process.cwd());
 	debug("loadConfig:", JSON.stringify(config));
@@ -2388,6 +2546,8 @@ export default function (pi: ExtensionAPI) {
 		// top-level transition takes every mirror with it.
 		sharedSessions.clear();
 		historyRewrittenBySession.clear();
+		isolatedForks.abortAll();
+		servedRequests.clear();
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
