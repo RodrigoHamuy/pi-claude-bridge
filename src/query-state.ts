@@ -20,6 +20,10 @@ export class QueryContext {
 	activeQuery: unknown | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
+	latestFingerprint: string | undefined = undefined;
+	/** Cursor and fingerprint of the history this query's CLI holds, as of its
+	 *  start or last full tool-result delivery. */
+	served: { cursor: number; fingerprint: string } | undefined = undefined;
 	pendingToolCalls = new Map<string, PendingToolCall>();
 	pendingResults = new Map<string, McpResult>();
 	/** tool_use ids emitted this turn. Sole purpose is routing a delivered result

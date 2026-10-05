@@ -29,6 +29,7 @@ import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
+import { fingerprintPriors } from "./priors-fingerprint.js";
 import { ForkRefused, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, type ForkProcess, type ServedRequest } from "./isolated-fork.js";
 
 // --- Debug logging ---
@@ -214,6 +215,26 @@ interface SessionState {
 	// with no query in flight does NOT set this — there's no concurrent CC writer
 	// then, so in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
+	// fingerprintPriors of history[0, cursor) when the cursor last moved. A
+	// session with a piSessionId is only resumed while this still matches.
+	fingerprint?: string;
+}
+
+/** Cursor and fingerprint for a session that has seen all of this context's history. */
+function contextMirror(context: Context): { cursor: number; fingerprint: string } {
+	const history = nonSystemMessages(context.messages);
+	const { customToolNameToSdk } = resolveMcpTools(context, askClaudeToolName);
+	return { cursor: history.length, fingerprint: fingerprintPriors(history, customToolNameToSdk) };
+}
+
+/** Whether the history pi hands a parked query no longer starts with what its
+ *  CLI was given. A context hook can rewrite it without any session event. */
+function servedPrefixChanged(c: QueryContext, context: Context): boolean {
+	if (c.piSessionId === null || !c.served) return false;
+	const history = nonSystemMessages(context.messages);
+	if (history.length < c.served.cursor) return true;
+	const { customToolNameToSdk } = resolveMcpTools(context, askClaudeToolName);
+	return fingerprintPriors(history.slice(0, c.served.cursor), customToolNameToSdk) !== c.served.fingerprint;
 }
 
 /**
@@ -761,6 +782,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 	piSessionId?: string | null,
+	sessionLive = false,
 ): SyncResult {
 	// System messages are pi's transcript representation of prompt and tool state, not
 	// conversation history — they are never imported into a CC session, so exclude them from
@@ -780,13 +802,22 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
+	//
+	// A session with a piSessionId also needs the prefix the cursor covers to be
+	// unchanged. Count alone misses a context hook that rewrites history (an
+	// in-place edit, or a compressed view that later grows back to the same
+	// count), and Claude Code would resume a conversation pi no longer has.
+	const keyed = piSessionId != null && !sessionLive;
+	const prefixMatches = (state: SessionState) =>
+		!keyed || (state.fingerprint !== undefined
+			&& fingerprintPriors(priorMessages.slice(0, state.cursor), customToolNameToSdk) === state.fingerprint);
+	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor && prefixMatches(sharedSession)) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
 		if (trailingAssistantOnly) {
-			setSessionStateFor(piSessionId, { ...sharedSession, cursor: priorMessages.length, cwd });
+			setSessionStateFor(piSessionId, { ...sharedSession, cursor: priorMessages.length, cwd, fingerprint: fingerprintPriors(priorMessages, customToolNameToSdk) });
 			debug(`Case 3: advanced cursor past trailing assistant, resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${priorMessages.length}`);
 		} else {
 			debug(`Case 3: resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
@@ -811,7 +842,9 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// Only reachable when needsRebuild is false — user-facing history rewrites
 	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
 	// sharedSession before the next syncSharedSession call.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
+	// With a piSessionId the bucket is that session's own, so a shorter or
+	// changed history is a rewrite of it: fall through and rebuild.
+	if (!keyed && sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
@@ -819,6 +852,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 
 	// REBUILD path
 	if (priorMessages.length === 0) {
+		if (keyed && sharedSession) setSessionStateFor(piSessionId, null);
 		debug(`Case 1: clean start, ${history.length} total messages`);
 		debug(`syncResult: path=clean-start`);
 		return { sessionId: null };
@@ -847,7 +881,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
+	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined, fingerprint: fingerprintPriors(priorMessages, customToolNameToSdk) });
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -1967,8 +2001,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// this tool result carry the turn into a fresh query over the rewritten history.
 	// The staleness mark is per pi session: a subagent's compaction (its own
 	// AgentSession, sharing this process) must not discard the parent's parked
-	// query, and vice versa.
-	const rewrittenUnderQuery = Boolean(resultCtx?.historyStale);
+	// query, and vice versa. A context hook rewrite has no mark, so the history
+	// itself is compared with what the query was served.
+	const prefixChanged = resultCtx !== undefined && !resultCtx.historyStale && servedPrefixChanged(resultCtx, context);
+	if (prefixChanged) debug("provider: history before this tool result differs from what the parked query was served");
+	const rewrittenUnderQuery = Boolean(resultCtx?.historyStale) || prefixChanged;
 	if (resultCtx && rewrittenUnderQuery) {
 		discardRewrittenQuery(resultCtx);
 		resultCtx = undefined;
@@ -2000,14 +2037,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// Delivery is async because the steer must reach CC's stdin *before* the
 		// tool result does — see deliverToolResults. Detached so the provider
 		// still returns its stream synchronously.
-		void deliverToolResults(resultCtx, allResults, steer, context.messages.length);
 		// The shared cursor tracks the top-level conversation. A reentrant subagent
 		// delivering its own results would drag it to that subagent's message count
 		// — observed pulling a parent from 5 back to 3, which cost the parent's next
 		// turn a full rebuild and a flushed prompt cache.
 		const state = sessionStateFor(resultCtx.piSessionId);
-		if (state) state.cursor = context.messages.length;
-		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
+		const mirror = contextMirror(context);
+		const delivered = resultCtx;
+		void deliverToolResults(delivered, allResults, steer, context.messages.length).then(() => {
+			if (!delivered.missedSteer) delivered.served = mirror;
+		});
+		if (state) Object.assign(state, mirror);
+		if (mirror.cursor >= resultCtx.latestCursor) {
+			resultCtx.latestCursor = mirror.cursor;
+			resultCtx.latestFingerprint = mirror.fingerprint;
+		}
 		return stream;
 	}
 
@@ -2024,7 +2068,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// count the result (options.sessionId is that session — pi emits the
 		// result event through the same session's streamSimple call).
 		const orphanState = sessionStateFor(options?.sessionId ?? null);
-		if (orphanState && activeQueryContexts.size === 0) orphanState.cursor = context.messages.length;
+		if (orphanState && activeQueryContexts.size === 0) Object.assign(orphanState, contextMirror(context));
 		// No query owns this result, so there is no context to reset: resetTurnState
 		// on the top-level ctx() would replace a live parent's turnOutput mid-stream,
 		// stranding the blocks it had already emitted. A throwaway context just
@@ -2093,6 +2137,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.turnToolCallIds = [];
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
+	queryCtx.latestFingerprint = undefined;
+	queryCtx.served = undefined;
 	// The served pi session, for rewrite attribution on delivery (issue #101
 	// follow-up) and on SessionState. A fresh instance of this module inside a
 	// worktree-spawned subagent has its own contexts; each records its own.
@@ -2110,7 +2156,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Which pi session this query serves — the attribution key for history
 	// rewrites (session_compact / session_tree) and for SessionState above.
 	const piSessionId = options?.sessionId ?? null;
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId);
+	// Another live query on this pi session may still be writing its file, so
+	// its sync keeps the count-based guard instead of rebuilding under it.
+	const sessionLive = piSessionId !== null && [...activeQueryContexts].some((c) => c.piSessionId === piSessionId && c.activeQuery !== null);
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId, sessionLive);
 	// This query starts from the history pi has now: consume this session's
 	// armed rewrite — a sibling pi session's stays armed for its own queries.
 	if (piSessionId) historyRewrittenBySession.delete(piSessionId);
@@ -2169,6 +2218,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let wasAborted = false;
 	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
+	queryCtx.served = contextMirror(context);
 	activeQueryContexts.add(queryCtx);
 
 	// 4. Capture context for abort handling
@@ -2236,11 +2286,16 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				const state = sessionStateFor(queryCtx.piSessionId);
 				const sessionId = capturedSessionId ?? state?.sessionId;
 				if (sessionId) {
-					const cursor = Math.max(context.messages.length, queryCtx.latestCursor, state?.cursor ?? 0);
+					const mirror = contextMirror(context);
+					const cursor = Math.max(mirror.cursor, queryCtx.latestCursor, state?.cursor ?? 0);
+					// Whichever context set the cursor also supplies the fingerprint of it.
+					const fingerprint = cursor === mirror.cursor
+						? mirror.fingerprint
+						: cursor === queryCtx.latestCursor ? queryCtx.latestFingerprint : state?.fingerprint;
 					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 					// A missed steer may precede the first mirror or arrive while this
 					// query is still able to complete. Preserve both rebuild signals.
-					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
+					setSessionStateFor(queryCtx.piSessionId, { ...state, sessionId, cursor, cwd, piSessionId: queryCtx.piSessionId ?? undefined, fingerprint, needsRebuild: queryCtx.missedSteer || state?.needsRebuild });
 				}
 			}
 
