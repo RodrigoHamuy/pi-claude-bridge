@@ -9,6 +9,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSession, deleteSession, openSession } from "cc-session-io";
 
+// Session files go under CLAUDE_CONFIG_DIR, ~/.claude by default: deleting them
+// still leaves a project dir per temporary cwd behind.
+const claudeDir = mkdtempSync(join(tmpdir(), "sync-shared-session-cc-"));
+process.env.CLAUDE_CONFIG_DIR = claudeDir;
+process.on("exit", () => rmSync(claudeDir, { recursive: true, force: true }));
+
 const { __test } = await import("../src/index.js");
 
 describe("syncSharedSession", () => {
