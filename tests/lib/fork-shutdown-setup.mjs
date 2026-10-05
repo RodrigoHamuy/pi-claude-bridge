@@ -3,10 +3,10 @@
 // SIGTERM-subprocess shutdown tests (tests/unit-fork-shutdown.mjs).
 //
 // CLAUDE_CONFIG_DIR must point at a throwaway dir before this is imported.
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
-import { openSession } from "cc-session-io";
+import { getSessionPath, openSession } from "cc-session-io";
 
 const mod = await import("../../src/index.js");
 const { __test } = mod;
@@ -33,7 +33,8 @@ __test.setQuery(({ options }) => {
 	const gen = (async function* () {
 		for (const step of script.steps) {
 			if (typeof step === "function") { await step(options); continue; }
-			yield step.type === "system" && options.resume ? { ...step, session_id: options.resume } : step;
+			const id = options.forkSession ? options.sessionId : options.resume;
+			yield step.type === "system" && id ? { ...step, session_id: id } : step;
 		}
 	})();
 	gen.interrupt = async () => {};
@@ -41,9 +42,7 @@ __test.setQuery(({ options }) => {
 	return gen;
 });
 
-export const sessionExists = (sessionId) => {
-	try { openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR }); return true; } catch { return false; }
-};
+export const sessionExists = (sessionId) => existsSync(getSessionPath(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR));
 
 /** Starts a main turn, then a fork whose CC process runs `childSource` and
  *  stays alive until killed. Resolves once the child has printed "ready". */
@@ -58,13 +57,22 @@ export async function startForkWithChild(childSource) {
 	];
 	let releaseMain;
 	const mainHeld = new Promise((r) => { releaseMain = r; });
+	const append = (sessionId, record) => {
+		const session = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		const last = session.records.at(-1);
+		appendFileSync(session.jsonlPath, JSON.stringify({ uuid: randomUUID(), parentUuid: last?.uuid ?? null, sessionId, timestamp: new Date().toISOString(), ...record }) + "\n");
+	};
+	// The fork starts once the main turn has answered, so the main turn answers.
+	const answer = randomUUID();
 	scripts.push({
-		onStart: (options) => {
-			const session = openSession({ sessionId: options.resume, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
-			const last = session.records.at(-1);
-			appendFileSync(session.jsonlPath, JSON.stringify({ uuid: randomUUID(), parentUuid: last?.uuid ?? null, sessionId: options.resume, timestamp: new Date().toISOString(), type: "user", message: { role: "user", content: prompt } }) + "\n");
-		},
-		steps: [{ type: "system", subtype: "init" }, () => mainHeld, { type: "result", subtype: "success", is_error: false, result: "ok" }],
+		onStart: (options) => append(options.resume, { type: "user", message: { role: "user", content: prompt } }),
+		steps: [
+			{ type: "system", subtype: "init" },
+			() => mainHeld,
+			(options) => append(options.resume, { type: "assistant", uuid: answer, message: { role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" } }),
+			{ type: "assistant", uuid: answer, message: { id: "msg_main", role: "assistant", content: [{ type: "text", text: "ok" }] } },
+			{ type: "result", subtype: "success", is_error: false, result: "ok" },
+		],
 	});
 	const main = providerConfig.streamSimple(model, { messages: history, tools }, { sessionId: "pi-shutdown" });
 
@@ -74,19 +82,29 @@ export async function startForkWithChild(childSource) {
 	let forkId;
 	scripts.push({
 		onStart: (options) => {
-			forkId = options.resume;
+			forkId = options.sessionId;
+			// What Claude Code does with forkSession: copy the session under the new id.
+			writeFileSync(getSessionPath(forkId, cwd, process.env.CLAUDE_CONFIG_DIR), "{}\n");
 			child = options.spawnClaudeCodeProcess({ command: process.execPath, args: ["-e", childSource], cwd, env: process.env, signal: options.abortController.signal });
 			child.stdout.once("data", () => ready());
 		},
 		steps: [{ type: "system", subtype: "init" }, (options) => new Promise((r) => options.abortController.signal.addEventListener("abort", r, { once: true }))],
 	});
-	for (let i = 0; i < 1000 && !__test.servedRequests.get("pi-shutdown"); i++) await new Promise((r) => setImmediate(r));
+	// ACP asks once the main reply streams, by when CC's init named the main session.
+	const mainStarted = () => __test.servedRequests.get("pi-shutdown") && [...__test.activeQueryContexts].some((c) => c.ccSessionId);
+	for (let i = 0; i < 1000 && !mainStarted(); i++) await new Promise((r) => setImmediate(r));
 	let accepted;
 	bus.emit(ISOLATED_FORK_CHANNEL, {
 		version: 1, piSessionId: "pi-shutdown", prompt: "NUDGE", captureTool: "compress", signal: new AbortController().signal,
 		accept: (result) => { accepted = Promise.resolve(result); accepted.catch(() => {}); return true; },
 	});
 	if (!accepted) throw new Error("fork was not accepted");
-	await childReady;
-	return { child, forkId, accepted, finishMain: async () => { releaseMain(); await main.result(); } };
+	releaseMain();
+	await main.result();
+	let timer;
+	const declined = accepted.then((result) => { throw new Error(`the fork ended before its process started: ${JSON.stringify(result)}`); });
+	declined.catch(() => {});
+	await Promise.race([childReady, declined, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("the fork's process never started")), 10_000); })]);
+	clearTimeout(timer);
+	return { child, forkId, accepted, finishMain: async () => {} };
 }

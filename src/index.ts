@@ -4,9 +4,9 @@ import { buildSessionContext, compact, generateBranchSummary, keyHint, type Bran
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, openSession, repairToolPairing } from "cc-session-io";
 import { spawn, type ChildProcess } from "child_process";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { DEBUG_LOG_PATH, DIAG_LOG_PATH } from "./log-paths.js";
@@ -23,14 +23,14 @@ import {
 	sharedPromptCaptures,
 	type PromptCapture,
 } from "./prompt-capture.js";
-import { collectCarriedAttachments, placeCarriedAttachments, promptsOf, recordPromptTexts, type CarriedAttachment } from "./attachments.js";
+import { collectCarriedAttachments, placeCarriedAttachments, promptsOf, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { fingerprintPriors } from "./priors-fingerprint.js";
-import { ForkRefused, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, type ForkProcess, type ServedRequest } from "./isolated-fork.js";
+import { ForkRefused, forkSettings, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, waitForAnswerEnd, type AnswerWait, type ForkFailure, type ForkProcess, type ForkSource, type ServedRequest } from "./isolated-fork.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -904,6 +904,9 @@ let queryImpl: typeof query = query;
 export const __test = {
 	get servedRequests() { return servedRequests; },
 	get isolatedForks() { return isolatedForks; },
+	setForkAnswerWait(wait: AnswerWait | null) {
+		forkAnswerWait = wait ?? FORK_ANSWER_WAIT;
+	},
 	setProviderSettings(settings: NonNullable<Config["provider"]>) {
 		providerSettings = settings;
 	},
@@ -1365,6 +1368,7 @@ function processStreamEvent(
 		// consumeQuery to skip it. The MCP handler blocks the generator until
 		// pi delivers the tool result via the next streamSimple call.
 		c.turnOutput.stopReason = "toolUse";
+		c.endServedTurn("toolUse");
 		const stream = c.currentPiStream;
 		stream!.push({ type: "done", reason: "toolUse", message: c.turnOutput });
 		markStreamComplete(stream);
@@ -1465,6 +1469,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
 		c.turnOutput.stopReason = "toolUse";
+		c.endServedTurn("toolUse");
 		const stream = c.currentPiStream;
 		stream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
 		markStreamComplete(stream);
@@ -1503,6 +1508,7 @@ async function consumeQuery(
 		// - rate-limit events: notifications to the user, which are most likely to
 		//   fire during exactly the long tool-using turns the guard was skipping.
 		let resultError: string | undefined;
+		if (message.type === "assistant" && typeof message.uuid === "string") queryCtx.lastAssistantUuid = message.uuid;
 		if (message.type === "result") {
 			queryCtx.promptStream?.end();
 			logServedContextWindow("result", message, model);
@@ -1520,6 +1526,7 @@ async function consumeQuery(
 					queryCtx.turnOutput.errorMessage = resultError;
 				}
 			}
+			queryCtx.endServedTurn(resultError === undefined && message.subtype === "success" ? "answer" : "failed");
 		}
 		if (message.type === "rate_limit_event") {
 			const info = (message as any).rate_limit_info;
@@ -1580,6 +1587,7 @@ async function consumeQuery(
 			case "system":
 				if ((message as any).subtype === "init" && (message as any).session_id) {
 					capturedSessionId = (message as any).session_id;
+					queryCtx.ccSessionId = capturedSessionId;
 				}
 				break;
 			case "user":
@@ -1763,34 +1771,16 @@ function systemPromptAppendFor(systemPrompt: string | undefined, mcpTools: Tool[
 const FORK_TOOL_REFUSAL = "Tool execution is disabled in this compression fork.";
 
 // Every pi session's last provider call, and the forks started from them. See
-// isolated-fork.ts: the fork rebuilds the recorded context into its own CC
-// session and runs it with the same options and tool definitions as the main
-// query, refusing every tool call.
+// isolated-fork.ts: Claude Code copies the main session at the end of the
+// recorded request and runs it with the same options and tool definitions as
+// the main query, refusing every tool call.
 const servedRequests = new ServedRequests();
 const isolatedForks = new IsolatedForks(servedRequests, {
 	// Without --strict-mcp-config CC loads filesystem MCP servers whose handlers are
 	// not the fork's refusing proxies, and bypassPermissions would let them run.
 	refusal: () => (providerSettings.strictMcpConfig === false ? "unsafe-config" : undefined),
-	createSession(served: ServedRequest): string {
-		const { customToolNameToSdk } = resolveMcpTools(served.context, askClaudeToolName);
-		const source = readForkSource(served);
-		const session = createSession({
-			projectPath: served.cwd,
-			claudeDir: process.env.CLAUDE_CONFIG_DIR,
-			model: claudeCodeModelId(served.model, longContextSettings),
-		});
-		const imported = convertAndImportMessages(session, nonSystemMessages(served.context.messages), customToolNameToSdk, source.carried);
-		// A fork missing an @file expansion the main session has would summarize a
-		// conversation the model never saw. Nothing is on disk before save().
-		const last = imported.promptTexts.length - 1;
-		if (imported.skippedAttachments.length || (last >= 0 && source.promptTexts[last] !== imported.promptTexts[last])) {
-			throw new ForkRefused("unsupported-context");
-		}
-		session.save();
-		verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, served.cwd);
-		return session.sessionId;
-	},
-	startQuery(served, sessionId, prompt, abortController) {
+	source: forkSource,
+	startQuery(served, target, prompt, abortController) {
 		const { mcpTools } = resolveMcpTools(served.context, askClaudeToolName);
 		const { systemPromptAppend } = systemPromptAppendFor(served.context.systemPrompt, mcpTools);
 		const mcpServers = mcpTools.length
@@ -1814,11 +1804,24 @@ const isolatedForks = new IsolatedForks(servedRequests, {
 			cwd: served.cwd,
 			systemPromptAppend,
 			mcpServers,
-			resume: sessionId,
+			resume: target.mainSessionId,
 			debugTag: "isolated-fork",
 		});
+		// Hooks would run user and plugin commands for a session the user never
+		// started; disableAllHooks leaves managed-policy hooks running.
+		const settings = forkSettings(queryOptions.settings);
+		if (!settings) throw new ForkRefused("unsafe-config");
 		const watched = watchedSpawn();
-		const forkQuery = queryImpl({ prompt, options: { ...queryOptions, abortController, maxTurns: 1, spawnClaudeCodeProcess: watched.spawn } });
+		const forkQuery = queryImpl({ prompt, options: {
+			...queryOptions,
+			settings,
+			forkSession: true,
+			sessionId: target.forkSessionId,
+			resumeSessionAt: target.resumeAt,
+			abortController,
+			maxTurns: 1,
+			spawnClaudeCodeProcess: watched.spawn,
+		} });
 		return { query: forkQuery, process: watched.process };
 	},
 	sdkToolName: (piToolName) => `${MCP_TOOL_PREFIX}${piToolName}`,
@@ -1826,17 +1829,63 @@ const isolatedForks = new IsolatedForks(servedRequests, {
 	debug,
 });
 
-/** The main session's @file expansions and prompt sequence, read strictly: a
- *  transcript that cannot be read refuses the fork rather than dropping files. */
-function readForkSource(served: ServedRequest): { carried: CarriedAttachment[]; promptTexts: string[] } {
-	const state = sessionStateFor(served.piSessionId);
-	if (!state) throw new ForkRefused("unsupported-context");
+/** The fork waits for the main turn at most as long as the extension waits for
+ *  the fork; a turn that ended gets this long to reach the transcript. */
+const FORK_ANSWER_WAIT: AnswerWait = { replyMs: 5 * 60_000, flushMs: 2_000, pollMs: 50 };
+let forkAnswerWait = FORK_ANSWER_WAIT;
+
+/** The main query serving `served`, if its CLI holds exactly that history. The
+ *  query, its input and its history are taken now: a later input, a rewrite or
+ *  another query on the session means the answer the fork waits for is not
+ *  this request's. */
+function forkSource(served: ServedRequest): ForkSource | ForkFailure {
+	const mirror = contextMirror(served.context);
+	const live = [...activeQueryContexts].filter((c) => c.piSessionId === served.piSessionId && c.activeQuery !== null);
+	if (live.length === 0) return "stale-context";
+	const c = live.find((q) => q.served?.cursor === mirror.cursor && q.served.fingerprint === mirror.fingerprint && !q.historyStale);
+	if (!c) return "stale-context";
+	const mainSessionId = c.ccSessionId;
+	const input = c.servedInput;
+	const owner = c.activeQuery;
+	if (!c.forkable || !mainSessionId || !input) return "unsupported-context";
+	const watch = {
+		reply: () => c.servedReplies.get(input),
+		superseded: () => c.servedInput !== input || c.historyStale || c.activeQuery !== owner,
+		records: () => recordsFrom(mainSessionId, served.cwd, input.fromByte),
+	};
+	return { mainSessionId, forkPoint: (signal) => waitForAnswerEnd(watch, input, signal, forkAnswerWait) };
+}
+
+function transcriptSize(sessionId: string, cwd: string): number {
 	try {
-		const { records } = openSession({ sessionId: state.sessionId, projectPath: served.cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
-		return { carried: collectCarriedAttachments(records), promptTexts: recordPromptTexts(records) };
+		return statSync(getSessionPath(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR)).size;
 	} catch {
-		throw new ForkRefused("unsupported-context");
+		return 0;
 	}
+}
+
+/** The records a transcript gained after its first `fromByte` bytes. A line CC
+ *  is still appending does not parse and is left for the next read. */
+function recordsFrom(sessionId: string, cwd: string, fromByte: number): Record<string, unknown>[] {
+	let text: string;
+	try {
+		const bytes = readFileSync(getSessionPath(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR));
+		if (bytes.length < fromByte) return [];
+		text = bytes.subarray(fromByte).toString("utf8");
+	} catch {
+		return [];
+	}
+	const records: Record<string, unknown>[] = [];
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const record: unknown = JSON.parse(line);
+			if (record && typeof record === "object") records.push(record as Record<string, unknown>);
+		} catch {
+			break;
+		}
+	}
+	return records;
 }
 
 const FORK_KILL_AFTER_MS = 10_000;
@@ -2054,8 +2103,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const state = sessionStateFor(resultCtx.piSessionId);
 		const mirror = contextMirror(context);
 		const delivered = resultCtx;
+		const fromByte = delivered.ccSessionId ? transcriptSize(delivered.ccSessionId, process.cwd()) : 0;
 		void deliverToolResults(delivered, allResults, steer, context.messages.length).then(() => {
-			if (!delivered.missedSteer) delivered.served = mirror;
+			if (delivered.missedSteer) return;
+			delivered.served = mirror;
+			delivered.serve(steer ? undefined : { kind: "toolResults", ids: allResults.flatMap((r) => (r.toolCallId ? [r.toolCallId] : [])), fromByte });
 		});
 		if (state) Object.assign(state, mirror);
 		if (mirror.cursor >= resultCtx.latestCursor) {
@@ -2226,9 +2278,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
+	const transcriptStart = resumeSessionId ? transcriptSize(resumeSessionId, cwd) : 0;
 	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	queryCtx.served = contextMirror(context);
+	// Until this query's init names its session, the context still holds the last one's.
+	queryCtx.ccSessionId = undefined;
+	queryCtx.serve({
+		kind: "prompt",
+		text: promptBlocks ? promptBlocks.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("\n") : promptText,
+		fromByte: transcriptStart,
+	});
+	queryCtx.forkable = !syncResult.preserveSharedSession;
 	activeQueryContexts.add(queryCtx);
 
 	// 4. Capture context for abort handling

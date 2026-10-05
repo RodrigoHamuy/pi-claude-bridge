@@ -30,15 +30,16 @@ const exitedOf = (child) => child.exitCode !== null || child.signalCode !== null
 function fakeFork({ exits, stuckQuery = false }) {
 	const served = new ServedRequests();
 	served.record("pi-a", { id: "m" }, { messages: [], tools: [{ name: "compress", description: "", parameters: {} }] }, undefined, "/cwd");
-	const log = { deleted: [], killed: 0 };
+	const log = { deleted: [], killed: 0, forkId: undefined };
 	let exit;
 	const exited = new Promise((r) => { exit = r; });
 	let started;
 	const running = new Promise((r) => { started = r; });
 	const forks = new IsolatedForks(served, {
 		refusal: () => undefined,
-		createSession: () => "fork-1",
-		startQuery: (_served, _id, _prompt, controller) => {
+		source: () => ({ mainSessionId: "main-1", forkPoint: async () => "cut-1" }),
+		startQuery: (_served, target, _prompt, controller) => {
+			log.forkId = target.forkSessionId;
 			const query = (async function* () {
 				await new Promise((r) => controller.signal.addEventListener("abort", r, { once: true }));
 				if (stuckQuery) await new Promise(() => {});
@@ -69,7 +70,7 @@ describe("isolated fork shutdown", () => {
 		await running;
 		await forks.shutdown(1000, 500);
 		assert.deepEqual(await accepted, { ok: false, reason: "aborted" });
-		assert.deepEqual(log.deleted, ["fork-1"]);
+		assert.deepEqual(log.deleted, [log.forkId]);
 		assert.equal(log.killed, 0);
 	});
 
@@ -77,7 +78,7 @@ describe("isolated fork shutdown", () => {
 		const { forks, log, running } = fakeFork({ exits: "on-close", stuckQuery: true });
 		await running;
 		await forks.shutdown(1000, 500);
-		assert.deepEqual(log.deleted, ["fork-1"]);
+		assert.deepEqual(log.deleted, [log.forkId]);
 		assert.equal(forks.unsettled.size, 0);
 	});
 
@@ -86,7 +87,7 @@ describe("isolated fork shutdown", () => {
 		await running;
 		await forks.shutdown(200, 50);
 		assert.equal(log.killed, 1);
-		assert.deepEqual(log.deleted, ["fork-1"]);
+		assert.deepEqual(log.deleted, [log.forkId]);
 	});
 
 	it("gives up at the deadline and leaves the session of a process that never exits", async () => {

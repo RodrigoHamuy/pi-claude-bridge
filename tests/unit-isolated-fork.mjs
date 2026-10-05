@@ -6,22 +6,23 @@
  * arguments of the model's first call to one tool, and execute nothing. The
  * failure modes are all silent: a fork built from a request mutated after it was
  * served, a fork whose tools or system prompt differ from the main query's, a
- * fork that runs where external tools could load, a fork missing an @file the
- * main session has, a fork session deleted while CC still writes it, or a fork
- * that reaches the main session's mirror or query state. These pin each of them.
+ * fork that runs where external tools could load, a fork copied from the wrong
+ * point of the main transcript, a fork session deleted while CC still writes it,
+ * or a fork that writes or deletes the main session or reaches its mirror or
+ * query state. These pin each of them.
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
-import { createSession, openSession, repairToolPairing } from "cc-session-io";
-import { ForkRefused, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, parseForkRequest } from "../src/isolated-fork.js";
+import { getProjectDir, getSessionPath, openSession } from "cc-session-io";
+import { answerEndIn, ForkRefused, forkSettings, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, parseForkRequest, waitForAnswerEnd } from "../src/isolated-fork.js";
 
 const claudeDir = mkdtempSync(join(tmpdir(), "claude-bridge-isolated-fork-cc-"));
 process.env.CLAUDE_CONFIG_DIR = claudeDir;
@@ -57,17 +58,16 @@ function assistant(content, usage = { input_tokens: 10, output_tokens: 2, cache_
 }
 
 function fakeDeps(script = () => [], extra = {}) {
-	const log = { created: [], started: [], deleted: [], closed: 0, processClosed: 0, debug: [] };
+	const log = { sources: [], started: [], deleted: [], closed: 0, processClosed: 0, debug: [] };
 	const deps = {
 		refusal: () => undefined,
-		createSession(served) {
-			const id = `fork-${log.created.length + 1}`;
-			log.created.push({ id, served });
-			return id;
+		source(served) {
+			log.sources.push({ served });
+			return { mainSessionId: "main-1", forkPoint: async () => "cut-1" };
 		},
-		startQuery(served, sessionId, prompt, abortController) {
-			log.started.push({ served, sessionId, prompt, abortController });
-			const steps = script(abortController);
+		startQuery(served, target, prompt, abortController) {
+			log.started.push({ served, target, prompt, abortController });
+			const steps = script(abortController, target);
 			const gen = (async function* () {
 				for (const step of steps) {
 					if (typeof step === "function") { await step(); continue; }
@@ -86,6 +86,106 @@ function fakeDeps(script = () => [], extra = {}) {
 }
 
 const COMPRESS_CALL = assistant([{ type: "tool_use", name: "mcp__custom-tools__compress", input: { startId: "m1" } }]);
+
+describe("answerEndIn", () => {
+	const prompt = (text, uuid) => ({ type: "user", uuid, message: { role: "user", content: text } });
+	const result = (ids, uuid) => ({ type: "user", uuid, message: { role: "user", content: ids.map((id) => ({ type: "tool_result", tool_use_id: id, content: "x" })) } });
+	const attachment = (uuid, type = "date") => ({ type: "attachment", uuid, attachment: { type } });
+	const reply = (uuid) => ({ type: "assistant", uuid, message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+	const atPrompt = (text) => ({ kind: "prompt", text, fromByte: 0 });
+
+	it("ends at the answer to the served prompt, past its attachments and earlier blocks, before anything CC writes after it", () => {
+		const records = [prompt("go", "p"), attachment("a"), reply("thinking"), reply("answer"), { type: "system", uuid: "s", subtype: "stop_hook_summary" }, prompt("next", "n")];
+		assert.equal(records[answerEndIn(records, atPrompt("go"), "answer")].uuid, "answer");
+	});
+
+	it("is undefined until the answer is on disk", () => {
+		assert.equal(answerEndIn([prompt("go", "p"), attachment("a")], atPrompt("go"), "answer"), undefined);
+		assert.equal(answerEndIn([reply("answer"), prompt("go", "p")], atPrompt("go"), "answer"), undefined, "an entry before the served input is not its answer");
+	});
+
+	it("is superseded when other input reached the turn before the answer", () => {
+		assert.equal(answerEndIn([prompt("go", "p"), prompt("go", "p2"), reply("answer")], atPrompt("go"), "answer"), "superseded");
+		assert.equal(answerEndIn([prompt("go", "p"), attachment("q", "queued_command"), reply("answer")], atPrompt("go"), "answer"), "superseded");
+		assert.equal(answerEndIn([prompt("go", "p"), { type: "user", uuid: "answer" }], atPrompt("go"), "answer"), "superseded", "the uuid names no assistant entry");
+	});
+
+	it("waits for every parallel result, wherever CC put each one", () => {
+		const input = { kind: "toolResults", ids: ["t1", "t2"], fromByte: 0 };
+		const split = [result(["t1"], "r1"), result(["t2"], "r2"), attachment("a"), reply("answer")];
+		assert.equal(split[answerEndIn(split, input, "answer")].uuid, "answer");
+		assert.equal(answerEndIn([result(["t1"], "r1"), reply("answer")], input, "answer"), undefined);
+		const joined = [result(["t1", "t2"], "r"), reply("answer")];
+		assert.equal(joined[answerEndIn(joined, input, "answer")].uuid, "answer");
+	});
+});
+
+describe("waitForAnswerEnd", () => {
+	const input = { kind: "prompt", text: "go", fromByte: 0 };
+	const onDisk = [{ type: "user", uuid: "p", message: { role: "user", content: "go" } }, { type: "assistant", uuid: "answer", message: { role: "assistant", content: [] } }];
+	const wait = { replyMs: 1_000, flushMs: 100, pollMs: 5 };
+	const watch = (over = {}) => ({ reply: () => undefined, superseded: () => false, records: () => onDisk, ...over });
+	const refusal = (promise) => promise.then(() => assert.fail("expected a refusal"), (error) => { assert.ok(error instanceof ForkRefused, String(error)); return error.reason; });
+
+	it("returns the answer's entry once the turn ended in an answer that is on disk", async () => {
+		let reply;
+		setTimeout(() => { reply = { kind: "answer", lastUuid: "answer" }; }, 20);
+		assert.equal(await waitForAnswerEnd(watch({ reply: () => reply }), input, new AbortController().signal, wait), "answer");
+	});
+
+	it("waits for an answer that reaches the transcript after the turn ended, and not forever", async () => {
+		let records = onDisk.slice(0, 1);
+		setTimeout(() => { records = onDisk; }, 30);
+		const late = watch({ reply: () => ({ kind: "answer", lastUuid: "answer" }), records: () => records });
+		assert.equal(await waitForAnswerEnd(late, input, new AbortController().signal, wait), "answer");
+		const never = watch({ reply: () => ({ kind: "answer", lastUuid: "answer" }), records: () => onDisk.slice(0, 1) });
+		const started = Date.now();
+		assert.equal(await refusal(waitForAnswerEnd(never, input, new AbortController().signal, wait)), "unsupported-context");
+		assert.ok(Date.now() - started < 1_000);
+	});
+
+	it("declines a turn that ended on a tool call or failed, without reading the transcript", async () => {
+		const unread = { records: () => assert.fail("read the transcript") };
+		assert.equal(await refusal(waitForAnswerEnd(watch({ ...unread, reply: () => ({ kind: "toolUse" }) }), input, new AbortController().signal, wait)), "unsupported-context");
+		assert.equal(await refusal(waitForAnswerEnd(watch({ ...unread, reply: () => ({ kind: "failed" }) }), input, new AbortController().signal, wait)), "stale-context");
+	});
+
+	it("prefers a recorded answer over the query having moved on, so a normal end is not taken for a stale one", async () => {
+		const ended = watch({ reply: () => ({ kind: "answer", lastUuid: "answer" }), superseded: () => true });
+		assert.equal(await waitForAnswerEnd(ended, input, new AbortController().signal, wait), "answer");
+	});
+
+	it("declines once the input is superseded with no answer, or the turn outlasts its deadline", async () => {
+		let superseded = false;
+		setTimeout(() => { superseded = true; }, 20);
+		assert.equal(await refusal(waitForAnswerEnd(watch({ superseded: () => superseded }), input, new AbortController().signal, wait)), "stale-context");
+		const started = Date.now();
+		assert.equal(await refusal(waitForAnswerEnd(watch(), input, new AbortController().signal, { ...wait, replyMs: 50 })), "stale-context");
+		assert.ok(Date.now() - started < 1_000);
+	});
+
+	it("declines an answer that other input overtook on disk", async () => {
+		const overtaken = [onDisk[0], { type: "user", uuid: "steer", message: { role: "user", content: "also" } }, onDisk[1]];
+		const w = watch({ reply: () => ({ kind: "answer", lastUuid: "answer" }), records: () => overtaken });
+		assert.equal(await refusal(waitForAnswerEnd(w, input, new AbortController().signal, wait)), "stale-context");
+	});
+
+	it("stops on abort", async () => {
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 20);
+		assert.equal(await refusal(waitForAnswerEnd(watch(), input, controller.signal, wait)), "aborted");
+	});
+});
+
+describe("forkSettings", () => {
+	it("turns hooks off on a copy of the main query's settings object, and has no fork for a settings file path", () => {
+		const main = { autoMemoryEnabled: false, claudeMdExcludes: ["x"] };
+		assert.deepEqual(forkSettings(main), { autoMemoryEnabled: false, claudeMdExcludes: ["x"], disableAllHooks: true });
+		assert.deepEqual(main, { autoMemoryEnabled: false, claudeMdExcludes: ["x"] }, "the main settings are not mutated");
+		assert.deepEqual(forkSettings(undefined), { disableAllHooks: true });
+		assert.equal(forkSettings("/path/settings.json"), undefined);
+	});
+});
 
 describe("parseForkRequest", () => {
 	it("accepts only the v1 shape", () => {
@@ -131,7 +231,7 @@ describe("IsolatedForks", () => {
 		forks.handle(r.data);
 		forks.handle({ ...r.data, version: 2 });
 		assert.equal(r.accepted.length, 0);
-		assert.equal(log.created.length, 0);
+		assert.equal(log.sources.length, 0);
 	});
 
 	it("accepts once even when the handler is registered twice", async () => {
@@ -144,7 +244,7 @@ describe("IsolatedForks", () => {
 		forks.handle(r.data);
 		assert.equal(r.accepted.length, 1);
 		await r.accepted[0];
-		assert.equal(log.created.length, 1);
+		assert.equal(log.started.length, 1);
 	});
 
 	it("starts no work when its acceptance is not the one taken", async () => {
@@ -154,7 +254,6 @@ describe("IsolatedForks", () => {
 		const forks = new IsolatedForks(served, deps);
 		forks.handle(request({ accept: () => false }).data);
 		await settle();
-		assert.equal(log.created.length, 0);
 		assert.equal(log.started.length, 0);
 	});
 
@@ -171,16 +270,17 @@ describe("IsolatedForks", () => {
 		hold.open();
 		const result = await r.accepted[0];
 		assert.equal(result.ok, true);
-		assert.equal(log.created[0].served.context.messages[0].content, "A1");
-		assert.equal(log.created[0].served.reasoning, "high");
+		assert.equal(log.sources[0].served.context.messages[0].content, "A1");
+		assert.equal(log.started[0].served.context.messages[0].content, "A1");
+		assert.equal(log.started[0].served.reasoning, "high");
 		assert.equal(served.get("pi-a").context.messages[0].content, "A2");
 	});
 
 	it("captures the first capture-tool call and its usage, and leaves no abort listener behind", async () => {
 		const served = new ServedRequests();
 		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
-		const { deps, log } = fakeDeps(() => [
-			{ type: "system", subtype: "init" },
+		const { deps, log } = fakeDeps((_, target) => [
+			{ type: "system", subtype: "init", session_id: target.forkSessionId },
 			assistant([
 				{ type: "tool_use", name: "mcp__custom-tools__read", input: { path: "x" } },
 				{ type: "tool_use", name: "mcp__custom-tools__compress", input: { startId: "m1", endId: "m2", summary: "s" } },
@@ -197,7 +297,54 @@ describe("IsolatedForks", () => {
 		assert.equal(log.processClosed, 1);
 		assert.equal(getEventListeners(r.controller.signal, "abort").length, 0);
 		await settle();
-		assert.deepEqual(log.deleted, ["fork-1"]);
+		assert.deepEqual(log.deleted, [log.started[0].target.forkSessionId]);
+	});
+
+	it("forks Claude Code's copy of the main session at the source's fork point, under a new id it owns", async () => {
+		const served = new ServedRequests();
+		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
+		const { deps, log } = fakeDeps(() => [COMPRESS_CALL]);
+		const forks = new IsolatedForks(served, deps);
+		const ids = new Set();
+		for (let i = 0; i < 3; i++) {
+			const r = request();
+			forks.handle(r.data);
+			assert.equal((await r.accepted[0]).ok, true);
+		}
+		for (const { target } of log.started) {
+			assert.equal(target.mainSessionId, "main-1");
+			assert.equal(target.resumeAt, "cut-1");
+			assert.match(target.forkSessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+			assert.notEqual(target.forkSessionId, "main-1");
+			ids.add(target.forkSessionId);
+		}
+		assert.equal(ids.size, 3, "each fork gets its own session");
+		await settle();
+		assert.deepEqual(log.deleted.sort(), [...ids].sort(), "only the forks' own sessions are deleted");
+	});
+
+	it("stops when init names a session other than the fork's, and deletes neither it nor the main one", async () => {
+		const served = new ServedRequests();
+		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
+		for (const named of ["main-1", "11111111-1111-4111-8111-111111111111", "../../escape"]) {
+			const { deps, log } = fakeDeps(() => [{ type: "system", subtype: "init", session_id: named }, COMPRESS_CALL]);
+			const forks = new IsolatedForks(served, deps);
+			const r = request();
+			forks.handle(r.data);
+			assert.deepEqual(await r.accepted[0], { ok: false, reason: "error" });
+			await settle();
+			assert.deepEqual(log.deleted, [log.started[0].target.forkSessionId], `${named} must not be deleted`);
+		}
+	});
+
+	it("accepts an init that names the fork's own session", async () => {
+		const served = new ServedRequests();
+		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
+		const { deps } = fakeDeps((_, target) => [{ type: "system", subtype: "init", session_id: target.forkSessionId }, COMPRESS_CALL]);
+		const forks = new IsolatedForks(served, deps);
+		const r = request();
+		forks.handle(r.data);
+		assert.equal((await r.accepted[0]).ok, true);
 	});
 
 	it("returns the capture at once but deletes the session only after the CC process exits", async () => {
@@ -213,10 +360,11 @@ describe("IsolatedForks", () => {
 		assert.equal(log.closed, 1, "the reader ended and the query was closed");
 		await settle();
 		assert.deepEqual(log.deleted, [], "the reader ending is not proof the process stopped writing");
-		assert.deepEqual([...forks.unsettled], ["fork-1"]);
+		const id = log.started[0].target.forkSessionId;
+		assert.deepEqual([...forks.unsettled], [id]);
 		exit.open();
 		await settle();
-		assert.deepEqual(log.deleted, ["fork-1"]);
+		assert.deepEqual(log.deleted, [id]);
 		assert.equal(forks.unsettled.size, 0);
 	});
 
@@ -249,20 +397,52 @@ describe("IsolatedForks", () => {
 		const r = request();
 		unsafe.handle(r.data);
 		assert.deepEqual(await r.accepted[0], { ok: false, reason: "unsafe-config" });
-		assert.equal(log.created.length, 0);
 		assert.equal(log.started.length, 0);
 	});
 
-	it("passes a refusal from session setup through as its reason, with nothing to delete", async () => {
+	it("declines with error, without throwing into the emitter, when the source throws", async () => {
 		const served = new ServedRequests();
 		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
-		const { deps, log } = fakeDeps(() => [], { createSession() { throw new ForkRefused("unsupported-context"); } });
+		const { deps, log } = fakeDeps(() => [], { source: () => { throw new TypeError("malformed"); } });
+		const forks = new IsolatedForks(served, deps);
+		const r = request();
+		assert.doesNotThrow(() => forks.handle(r.data));
+		assert.deepEqual(await r.accepted[0], { ok: false, reason: "error" });
+		assert.equal(log.started.length, 0);
+		assert.ok(log.debug.some((line) => line.includes("TypeError")) && !log.debug.some((line) => line.includes("malformed")));
+	});
+
+	it("passes a refusal from the source or its fork point through as its reason, with nothing started or deleted", async () => {
+		const served = new ServedRequests();
+		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
+		const cases = [
+			[{ source: () => "stale-context" }, "stale-context"],
+			[{ source: () => ({ mainSessionId: "main-1", forkPoint: async () => { throw new ForkRefused("unsupported-context"); } }) }, "unsupported-context"],
+		];
+		for (const [extra, reason] of cases) {
+			const { deps, log } = fakeDeps(() => [], extra);
+			const forks = new IsolatedForks(served, deps);
+			const r = request();
+			forks.handle(r.data);
+			assert.deepEqual(await r.accepted[0], { ok: false, reason });
+			assert.equal(log.started.length, 0);
+			assert.deepEqual(log.deleted, []);
+		}
+	});
+
+	it("stops waiting for a fork point when aborted", async () => {
+		const served = new ServedRequests();
+		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
+		const { deps, log } = fakeDeps(() => [], {
+			source: () => ({ mainSessionId: "main-1", forkPoint: (signal) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(new ForkRefused("aborted")))) }),
+		});
 		const forks = new IsolatedForks(served, deps);
 		const r = request();
 		forks.handle(r.data);
-		assert.deepEqual(await r.accepted[0], { ok: false, reason: "unsupported-context" });
+		await settle();
+		r.controller.abort();
+		assert.deepEqual(await r.accepted[0], { ok: false, reason: "aborted" });
 		assert.equal(log.started.length, 0);
-		assert.deepEqual(log.deleted, []);
 	});
 
 	it("stops promptly on abort but keeps the session until the process exits", async () => {
@@ -284,7 +464,7 @@ describe("IsolatedForks", () => {
 		assert.deepEqual(log.deleted, []);
 		exit.open();
 		await settle();
-		assert.deepEqual(log.deleted, ["fork-1"]);
+		assert.deepEqual(log.deleted, [log.started[0].target.forkSessionId]);
 	});
 
 	it("abortAll stops running forks", async () => {
@@ -302,7 +482,7 @@ describe("IsolatedForks", () => {
 	it("reports a setup failure by kind only", async () => {
 		const served = new ServedRequests();
 		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
-		const { deps, log } = fakeDeps(() => [], { createSession() { throw new Error("secret sk-ant-123 in path"); } });
+		const { deps, log } = fakeDeps(() => [], { source: () => ({ mainSessionId: "main-1", forkPoint: async () => { throw new Error("secret sk-ant-123 in path"); } }) });
 		const forks = new IsolatedForks(served, deps);
 		const r = request();
 		forks.handle(r.data);
@@ -314,7 +494,6 @@ describe("IsolatedForks", () => {
 describe("isolated fork through the provider", async () => {
 	const mod = await import("../src/index.js");
 	const { __test } = mod;
-	const { convertPiMessages } = await import("../src/convert.js");
 	let providerConfig;
 	const bus = createEventBus();
 	mod.default({
@@ -354,6 +533,7 @@ describe("isolated fork through the provider", async () => {
 	beforeEach(() => {
 		__test.resetSharedSession();
 		__test.setProviderSettings({});
+		__test.setForkAnswerWait({ replyMs: 3_000, flushMs: 300, pollMs: 10 });
 		queries.length = 0;
 		scripts.length = 0;
 		__test.setQuery(({ options, prompt }) => {
@@ -365,7 +545,9 @@ describe("isolated fork through the provider", async () => {
 			const gen = (async function* () {
 				for (const step of script.steps) {
 					if (typeof step === "function") { await step(); continue; }
-					yield step.type === "system" && options.resume ? { ...step, session_id: options.resume } : step;
+					// What CC reports: the forked session's id, else the resumed one.
+					const id = options.forkSession ? options.sessionId : options.resume;
+					yield step.type === "system" && id && !step.session_id ? { ...step, session_id: id } : step;
 				}
 			})();
 			gen.interrupt = async () => { entry.interrupted++; };
@@ -376,6 +558,7 @@ describe("isolated fork through the provider", async () => {
 	afterEach(() => {
 		__test.setQuery(null);
 		__test.setProviderSettings({});
+		__test.setForkAnswerWait(null);
 	});
 
 	let clock = 0;
@@ -401,19 +584,31 @@ describe("isolated fork through the provider", async () => {
 	const appendRecord = (sessionId, record) => {
 		const session = openSession({ sessionId, projectPath: cwd, claudeDir });
 		const last = session.records.at(-1);
-		const uuid = randomUUID();
-		appendFileSync(session.jsonlPath, JSON.stringify({ uuid, parentUuid: last?.uuid ?? null, sessionId, timestamp: new Date().toISOString(), ...record }) + "\n");
-		return uuid;
+		const full = { uuid: randomUUID(), parentUuid: last?.uuid ?? null, sessionId, timestamp: new Date().toISOString(), ...record };
+		appendFileSync(session.jsonlPath, JSON.stringify(full) + "\n");
+		return full.uuid;
 	};
 	// Claude Code records the prompt it was handed (the latest pi prompt) before it streams a reply.
 	const ccRecordsPrompt = (text) => (entry) => appendRecord(entry.options.resume, { type: "user", message: { role: "user", content: text } });
+	const answerMessage = (uuid, text = "answer") => ({ type: "assistant", uuid, message: { id: `msg_${uuid.slice(0, 8)}`, role: "assistant", content: [{ type: "text", text }] } });
+	const answerRecord = (uuid, text = "answer") => ({ type: "assistant", uuid, message: { role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" } });
+	const success = { type: "result", subtype: "success", is_error: false, result: "ok" };
 
-	async function startMain(piSessionId, history) {
+	// A main turn that answers once released. `flush` is when the answer reaches
+	// the transcript: with the message (as CC does), after the result, or never.
+	async function startMain(piSessionId, history, { flush = "with-message" } = {}) {
 		const hold = gate();
-		scripts.push({ label: `main:${piSessionId}`, onStart: ccRecordsPrompt(history.at(-1).content), steps: [{ type: "system", subtype: "init" }, hold.wait, { type: "result", subtype: "success", is_error: false, result: "ok" }] });
+		const answer = randomUUID();
+		const entry = {};
+		const write = () => appendRecord(entry.mainId, answerRecord(answer));
+		scripts.push({
+			label: `main:${piSessionId}`,
+			onStart: (q) => { entry.mainId = q.options.resume; ccRecordsPrompt(history.at(-1).content)(q); },
+			steps: [{ type: "system", subtype: "init" }, hold.wait, () => { if (flush === "with-message") write(); }, answerMessage(answer), success],
+		});
 		const stream = streamSimple(model, { systemPrompt: undefined, messages: history, tools }, { sessionId: piSessionId });
 		await settle();
-		return { query: queries.at(-1), finish: async () => { hold.open(); await stream.result(); } };
+		return { query: queries.at(-1), answer, stream, write, finish: async () => { hold.open(); await stream.result(); } };
 	}
 
 	const forkScript = (onStart) => ({
@@ -424,35 +619,51 @@ describe("isolated fork through the provider", async () => {
 			{ type: "tool_use", name: "mcp__custom-tools__compress", input: { startId: "m00001" } },
 		])],
 	});
+	const projectFiles = () => readdirSync(getProjectDir(cwd, claudeDir)).sort();
+	const bytesOf = (sessionId) => readFileSync(getSessionPath(sessionId, cwd, claudeDir), "utf8");
 
-	it("runs on the served context with the main query's options and tools, refuses every tool, and leaves the main session alone", async () => {
+	it("forks Claude Code's own copy of the main session at the served request's answer, once the main turn ends, with the main query's options and tools, and leaves the main session alone", async () => {
 		const history = historyFor("A");
 		const historyBefore = structuredClone(history);
 		const toolsBefore = structuredClone(tools);
 		const main = await startMain("pi-main", history);
-		const mainShared = { ...__test.getSharedSession("pi-main") };
-		const activeBefore = [...__test.activeQueryContexts];
+		const mainId = main.query.options.resume;
 		const servedBefore = structuredClone(__test.servedRequests.get("pi-main"));
 
-		let forkMessages;
-		scripts.push(forkScript((entry) => { forkMessages = openSession({ sessionId: entry.options.resume, projectPath: cwd, claudeDir }).messages.map((m) => m.message ?? m); }));
+		let filesAtStart;
+		scripts.push(forkScript(() => { filesAtStart = projectFiles(); }));
 		const r = acpRequest("pi-main");
 		assert.ok(r.accepted, "the serving instance accepts in the emit tick");
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert.equal(queries.length, 1, "no fork starts while the main turn runs");
+		assert.equal(main.query.closed + main.query.interrupted, 0, "the main query is not stopped or held");
+
+		await main.finish();
+		const mainShared = { ...__test.getSharedSession("pi-main") };
+		const activeBefore = [...__test.activeQueryContexts];
+		const mainBytes = bytesOf(mainId);
+		const filesBefore = projectFiles();
 		const result = await r.accepted;
 		assert.deepEqual(result.ok && result.args, { startId: "m00001" });
 
 		const fork = queries[1];
 		assert.equal(fork.label, "fork");
 		assert.equal(fork.prompt, "NUDGE");
-		assert.notEqual(fork.options.resume, main.query.options.resume);
-		assert.notEqual(fork.options.resume, mainShared.sessionId);
+		assert.equal(fork.options.resume, mainId, "Claude Code copies the main session itself");
+		assert.equal(fork.options.forkSession, true, "into a new session, never writing the main one");
+		assert.match(fork.options.sessionId, /^[0-9a-f-]{36}$/);
+		assert.notEqual(fork.options.sessionId, mainId);
+		assert.equal(fork.options.resumeSessionAt, main.answer, "up to the answer to the served request");
+		assert.deepEqual(filesAtStart, filesBefore, "the bridge writes no session of its own for the fork");
 		assert.equal(fork.options.maxTurns, 1, "one turn: a second one would answer the refused tool call upstream");
 		assert.ok(fork.options.abortController instanceof AbortController);
 		assert.equal(typeof fork.options.spawnClaudeCodeProcess, "function");
 		assert.equal(main.query.options.spawnClaudeCodeProcess, undefined, "the main query keeps the SDK's own spawner");
-		for (const key of ["cwd", "tools", "permissionMode", "includePartialMessages", "settings", "systemPrompt", "extraArgs", "env", "effort"]) {
+		for (const key of ["cwd", "tools", "permissionMode", "includePartialMessages", "systemPrompt", "extraArgs", "env", "effort", "settingSources"]) {
 			assert.deepEqual(fork.options[key], main.query.options[key], `fork ${key} differs from the main query's`);
 		}
+		assert.deepEqual(fork.options.settings, { ...main.query.options.settings, disableAllHooks: true }, "the fork's settings are the main query's with hooks off");
+		assert.equal(main.query.options.settings.disableAllHooks, undefined, "the main query keeps its hooks");
 
 		const client = new Client({ name: "test", version: "1" });
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -465,72 +676,191 @@ describe("isolated fork through the provider", async () => {
 		}
 		await client.close();
 
-		// What a main-session rebuild of the same history writes.
-		const rebuilt = createSession({ projectPath: cwd, claudeDir });
-		rebuilt.importMessages(repairToolPairing(convertPiMessages(history, new Map([["read", "mcp__custom-tools__read"], ["compress", "mcp__custom-tools__compress"]])).anthropicMessages));
-		const expected = rebuilt.messages.map((m) => m.message ?? m);
-		assert.deepEqual(forkMessages.map((m) => ({ role: m.role, content: m.content })), expected.map((m) => ({ role: m.role, content: m.content })));
-		const blocks = forkMessages.flatMap((m) => Array.isArray(m.content) ? m.content : []);
-		assert.equal(blocks.find((b) => b.type === "thinking").signature, "sig-verbatim-123");
-		assert.deepEqual(blocks.find((b) => b.type === "tool_use").input, history[1].content[1].arguments);
-
+		assert.equal(bytesOf(mainId), mainBytes, "the main transcript, signed thinking included, is byte-for-byte unchanged");
+		assert.ok(mainBytes.includes("sig-verbatim-123"));
 		assert.deepEqual(history, historyBefore, "the caller's history is not mutated");
 		assert.deepEqual(tools, toolsBefore, "the caller's tools are not mutated");
 		assert.deepEqual(__test.servedRequests.get("pi-main"), servedBefore, "the fork does not mutate the recorded request");
 		assert.equal(fork.closed, 1);
 		await settle();
-		assert.equal(sessionExists(fork.options.resume), false, "the fork session is deleted");
+		assert.deepEqual(projectFiles(), filesBefore);
 		assert.deepEqual({ ...__test.getSharedSession("pi-main") }, mainShared, "the main session mirror is untouched");
-		assert.deepEqual([...__test.activeQueryContexts], activeBefore, "the fork never joins the routed query contexts");
-		assert.equal(main.query.closed + main.query.interrupted, 0, "the main query is not stopped");
-		assert.ok(sessionExists(mainShared.sessionId), "the main CC session is still on disk");
-		await main.finish();
+		assert.ok([...__test.activeQueryContexts].every((c) => activeBefore.includes(c)), "the fork never joins the routed query contexts");
 	});
 
-	it("routes by session: a fork for one session uses its own request while another session streams", async () => {
+	it("routes by session: a fork for one session copies that session while another streams", async () => {
 		const a = await startMain("pi-a", historyFor("A"));
 		const b = await startMain("pi-b", historyFor("B"));
 		const sharedA = { ...__test.getSharedSession("pi-a") };
-		let forkRecords;
-		scripts.push(forkScript((entry) => { forkRecords = sessionRecords(entry.options.resume); }));
-		const result = await acpRequest("pi-b").accepted;
-		assert.equal(result.ok, true);
-		const prompts = forkRecords.filter((r) => r.type === "user" && typeof r.message.content === "string").map((r) => r.message.content);
-		assert.deepEqual(prompts, ["[m00001] B read it", "[m00005] B next"]);
+		scripts.push(forkScript());
+		const pending = acpRequest("pi-b").accepted;
+		await b.finish();
+		assert.equal((await pending).ok, true);
+		const fork = queries.at(-1);
+		assert.equal(fork.options.resume, b.query.options.resume);
+		assert.equal(fork.options.resumeSessionAt, b.answer);
 		assert.deepEqual({ ...__test.getSharedSession("pi-a") }, sharedA);
 		await a.finish();
-		await b.finish();
 	});
 
-	it("carries the main session's @file expansions into the fork", async () => {
-		const main = await startMain("pi-att", historyFor("A"));
-		const mainId = __test.getSharedSession("pi-att").sessionId;
-		const prompt = sessionRecords(mainId).find((r) => r.type === "user" && r.message.content === "[m00001] A read it");
-		appendRecord(mainId, { type: "attachment", parentUuid: prompt.uuid, attachment: { type: "file", filename: "/a.js", content: { type: "text", file: { filePath: "/a.js", content: "x" } } } });
-		let forkRecords;
-		scripts.push(forkScript((entry) => { forkRecords = sessionRecords(entry.options.resume); }));
-		const result = await acpRequest("pi-att").accepted;
-		assert.equal(result.ok, true);
-		assert.deepEqual(forkRecords.filter((r) => r.type === "attachment").map((r) => r.attachment.filename), ["/a.js"]);
-		await main.finish();
+	it("waits for an answer that reaches the transcript after the turn ended, and refuses if it never does", async () => {
+		const late = await startMain("pi-late", historyFor("W"), { flush: "after-result" });
+		scripts.push(forkScript());
+		const pending = acpRequest("pi-late").accepted;
+		await late.finish();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert.equal(queries.at(-1).label, "main:pi-late", "not before the answer is on disk");
+		late.write();
+		assert.equal((await pending).ok, true);
+		assert.equal(queries.at(-1).options.resumeSessionAt, late.answer);
+
+		const never = await startMain("pi-never", historyFor("N"), { flush: "never" });
+		const refused = acpRequest("pi-never").accepted;
+		await never.finish();
+		const started = Date.now();
+		assert.deepEqual(await refused, { ok: false, reason: "unsupported-context" });
+		assert.ok(Date.now() - started < 2_000);
+		assert.equal(queries.at(-1).label, "main:pi-never", "no fork query is started");
 	});
 
-	it("refuses when an @file expansion cannot be placed, or the main transcript has not recorded the latest prompt", async () => {
-		const main = await startMain("pi-skip", historyFor("A"));
-		const mainId = __test.getSharedSession("pi-skip").sessionId;
-		const orphanParent = appendRecord(mainId, { type: "user", message: { role: "user", content: "a prompt pi never had" } });
-		appendRecord(mainId, { type: "attachment", parentUuid: orphanParent, attachment: { type: "file", filename: "/lost.js" } });
-		assert.deepEqual(await acpRequest("pi-skip").accepted, { ok: false, reason: "unsupported-context" });
-		await main.finish();
-
+	it("the next prompt may start before the answer is on disk: the fork still cuts at this request's answer", async () => {
+		const history = historyFor("N");
+		const first = await startMain("pi-next", history, { flush: "after-result" });
+		const mainId = first.query.options.resume;
+		const pending = acpRequest("pi-next").accepted;
+		await first.finish();
+		const next = [...history, asst([{ type: "text", text: "answer" }]), { role: "user", content: "[m00007] N again", timestamp: clock++ }];
 		const hold = gate();
-		scripts.push({ label: "main:pi-behind", steps: [{ type: "system", subtype: "init" }, hold.wait, { type: "result", subtype: "success", is_error: false, result: "ok" }] });
-		const behind = streamSimple(model, { systemPrompt: undefined, messages: historyFor("B"), tools }, { sessionId: "pi-behind" });
+		scripts.push({ label: "main:pi-next:2", steps: [{ type: "system", subtype: "init" }, hold.wait, success] });
+		const second = streamSimple(model, { systemPrompt: undefined, messages: next, tools }, { sessionId: "pi-next" });
 		await settle();
-		assert.deepEqual(await acpRequest("pi-behind").accepted, { ok: false, reason: "unsupported-context" });
-		assert.deepEqual(queries.map((q) => q.label), ["main:pi-skip", "main:pi-behind"], "no fork query is started");
+		assert.equal(queries.at(-1).label, "main:pi-next:2", "a new query now holds the session");
+		scripts.push(forkScript());
+		first.write();
+		appendRecord(mainId, { type: "user", message: { role: "user", content: "[m00007] N again" } });
+		assert.equal((await pending).ok, true);
+		const fork = queries.at(-1);
+		assert.equal(fork.label, "fork");
+		assert.equal(fork.options.resumeSessionAt, first.answer);
 		hold.open();
-		await behind.result();
+		await second.result();
+	});
+
+	it("declines when the main turn is aborted before it answers, and never holds the main stream", async () => {
+		const hold = gate();
+		const controller = new AbortController();
+		scripts.push({ label: "main:pi-abort", onStart: ccRecordsPrompt(historyFor("X").at(-1).content), steps: [{ type: "system", subtype: "init" }, hold.wait, success] });
+		const stream = streamSimple(model, { systemPrompt: undefined, messages: historyFor("X"), tools }, { sessionId: "pi-abort", signal: controller.signal });
+		await settle();
+		const pending = acpRequest("pi-abort").accepted;
+		controller.abort();
+		hold.open();
+		await stream.result();
+		assert.deepEqual(await pending, { ok: false, reason: "stale-context" });
+		assert.equal(queries.at(-1).label, "main:pi-abort");
+	});
+
+	it("does not take the previous query's session for a query whose init has not arrived", async () => {
+		const history = historyFor("I");
+		const first = await startMain("pi-reinit", history);
+		await first.finish();
+		const hold = gate();
+		scripts.push({ label: "main:pi-reinit:2", steps: [hold.wait, { type: "system", subtype: "init" }, success] });
+		const next = [...history, asst([{ type: "text", text: "answer" }]), { role: "user", content: "[m00007] I again", timestamp: clock++ }];
+		const second = streamSimple(model, { systemPrompt: undefined, messages: next, tools }, { sessionId: "pi-reinit" });
+		await settle();
+		assert.deepEqual(await acpRequest("pi-reinit").accepted, { ok: false, reason: "unsupported-context" });
+		assert.equal(queries.at(-1).label, "main:pi-reinit:2");
+		hold.open();
+		await second.result();
+	});
+
+	it("declines a main turn that outlasts the wait", async () => {
+		__test.setForkAnswerWait({ replyMs: 80, flushMs: 300, pollMs: 10 });
+		const slow = await startMain("pi-slow", historyFor("S"));
+		const started = Date.now();
+		assert.deepEqual(await acpRequest("pi-slow").accepted, { ok: false, reason: "stale-context" });
+		assert.ok(Date.now() - started < 2_000);
+		assert.equal(queries.at(-1).label, "main:pi-slow");
+		await slow.finish();
+	});
+
+	describe("at a tool result", () => {
+		const ev = (event) => ({ type: "stream_event", event });
+		const toolUse = (id) => [
+			ev({ type: "message_start", message: { id: `msg_${id}`, usage: {} } }),
+			ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: "mcp__custom-tools__read", input: {} } }),
+			ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"path":"a"}' } }),
+			ev({ type: "content_block_stop", index: 0 }),
+			ev({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: {} }),
+			ev({ type: "message_stop" }),
+		];
+
+		async function parkOnTool(sid, id) {
+			const held = gate();
+			const answer = randomUUID();
+			const entry = {};
+			const prompt = { role: "user", content: `${sid} read a`, timestamp: clock++ };
+			scripts.push({
+				label: `main:${sid}`,
+				onStart: (q) => { entry.mainId = q.options.resume; ccRecordsPrompt(prompt.content)(q); },
+				steps: [{ type: "system", subtype: "init" }, ...toolUse(id), held.wait, () => appendRecord(entry.mainId, answerRecord(answer)), answerMessage(answer), success],
+			});
+			const before = [...historyFor(sid), prompt];
+			const first = streamSimple(model, { systemPrompt: undefined, messages: before, tools }, { sessionId: sid });
+			await first.result();
+			const call = asst([{ type: "toolCall", id, name: "read", arguments: { path: "a" } }], "toolUse");
+			const result = { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "file" }], isError: false, timestamp: clock++ };
+			return { mainId: entry.mainId, before, call, result, held, answer };
+		}
+
+		it("declines a request that ended on a tool call, with nothing started", async () => {
+			const t = await parkOnTool("pi-tooluse", "toolu_0");
+			assert.deepEqual(await acpRequest("pi-tooluse").accepted, { ok: false, reason: "unsupported-context" });
+			assert.equal(queries.at(-1).label, "main:pi-tooluse");
+			const delivery = streamSimple(model, { systemPrompt: undefined, messages: [...t.before, t.call, t.result], tools }, { sessionId: "pi-tooluse" });
+			await settle();
+			t.held.open();
+			await delivery.result();
+		});
+
+		it("forks at the answer that follows the delivered tool result", async () => {
+			const t = await parkOnTool("pi-tool", "toolu_1");
+			const delivery = streamSimple(model, { systemPrompt: undefined, messages: [...t.before, t.call, t.result], tools }, { sessionId: "pi-tool" });
+			await settle();
+			appendRecord(t.mainId, { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "file" }] } });
+			scripts.push(forkScript());
+			const pending = acpRequest("pi-tool").accepted;
+			t.held.open();
+			await delivery.result();
+			assert.equal((await pending).ok, true);
+			const fork = queries.at(-1);
+			assert.equal(fork.options.resume, t.mainId);
+			assert.equal(fork.options.resumeSessionAt, t.answer);
+		});
+
+		it("refuses when a steer came with the tool result, since its place in the transcript is Claude Code's", async () => {
+			const t = await parkOnTool("pi-steer", "toolu_2");
+			const steer = { role: "user", content: "also check b", timestamp: clock++ };
+			const delivery = streamSimple(model, { systemPrompt: undefined, messages: [...t.before, t.call, t.result, steer], tools }, { sessionId: "pi-steer" });
+			await settle();
+			appendRecord(t.mainId, { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_2", content: "file" }] } });
+			const pending = acpRequest("pi-steer").accepted;
+			t.held.open();
+			await delivery.result();
+			const refused = await pending;
+			assert.equal(refused.ok, false);
+			assert.ok(["unsupported-context", "stale-context"].includes(refused.reason), refused.reason);
+			assert.notEqual(queries.at(-1).label, "fork");
+		});
+	});
+
+	it("refuses a stale request: the query that served it has finished", async () => {
+		const main = await startMain("pi-done", historyFor("D"));
+		await main.finish();
+		await settle();
+		assert.deepEqual(await acpRequest("pi-done").accepted, { ok: false, reason: "stale-context" });
+		assert.deepEqual(queries.map((q) => q.label), ["main:pi-done"]);
 	});
 
 	it("refuses without spawning anything when strict MCP config is off", async () => {
@@ -541,24 +871,46 @@ describe("isolated fork through the provider", async () => {
 		await main.finish();
 	});
 
+	it("repeated forks of one request each get their own session, all deleted, the main one kept", async () => {
+		const main = await startMain("pi-again", historyFor("R"));
+		const mainId = main.query.options.resume;
+		const pending = [];
+		for (let i = 0; i < 3; i++) {
+			scripts.push(forkScript((entry) => { writeFileSync(getSessionPath(entry.options.sessionId, cwd, claudeDir), "{}\n"); }));
+			pending.push(acpRequest("pi-again").accepted);
+		}
+		await main.finish();
+		const mainBytes = bytesOf(mainId);
+		for (const result of await Promise.all(pending)) assert.equal(result.ok, true);
+		const ids = queries.filter((q) => q.label === "fork").map((q) => q.options.sessionId);
+		await settle();
+		assert.equal(new Set(ids).size, 3);
+		for (const id of ids) assert.equal(sessionExists(id), false);
+		assert.equal(bytesOf(mainId), mainBytes);
+	});
+
 	it("deletes the fork session only after its real CC process exits, and starts none after close", async () => {
 		const main = await startMain("pi-proc", historyFor("A"));
 		let spawned;
 		let spawner;
+		let forkId;
 		scripts.push(forkScript((entry) => {
+			forkId = entry.options.sessionId;
+			writeFileSync(getSessionPath(forkId, cwd, claudeDir), "{}\n");
 			spawner = entry.options.spawnClaudeCodeProcess;
 			spawned = spawner({ command: process.execPath, args: ["-e", "setTimeout(() => {}, 300)"], cwd, env: process.env, signal: new AbortController().signal });
 		}));
-		const result = await acpRequest("pi-proc").accepted;
+		const pending = acpRequest("pi-proc").accepted;
+		await main.finish();
+		const result = await pending;
 		assert.equal(result.ok, true);
-		const forkId = queries[1].options.resume;
 		await settle();
 		assert.equal(spawned.exitCode, null, "the child is still running");
-		assert.ok(sessionExists(forkId), "its session is kept while it can still write");
+		assert.ok(existsSync(getSessionPath(forkId, cwd, claudeDir)), "its session is kept while it can still write");
 		await new Promise((resolve) => spawned.once("exit", resolve));
 		await settle();
-		assert.equal(sessionExists(forkId), false, "deleted once the child exited");
+		assert.equal(existsSync(getSessionPath(forkId, cwd, claudeDir)), false, "deleted once the child exited");
+		assert.ok(sessionExists(main.query.options.resume), "the main session is kept");
 		assert.throws(() => spawner({ command: process.execPath, args: ["-e", ""], cwd, env: process.env, signal: new AbortController().signal }), /closed/);
-		await main.finish();
 	});
 });

@@ -138,7 +138,7 @@ To add instructions, use `message`, `context`, or a system-message edit that kee
 [ -n "$PI_CODING_AGENT" ] && exit 0
 ```
 
-Hooks do not fire on the compact-summary side query.
+Hooks do not fire on the compact-summary side query. The isolated compression fork (billion-context-pi `compress.async`) runs with `disableAllHooks`, so hooks from settings files and installed plugins do not run in it; hooks from managed policy settings still do, and Claude Code still writes its own state (for example `~/.claude.json`) as it does on any query.
 
 ### System prompt rejections
 

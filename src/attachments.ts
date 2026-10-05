@@ -38,7 +38,7 @@ export type CarriedAttachment = {
 type Rec = Record<string, unknown>;
 
 /** A user record holding a prompt, as opposed to one holding tool results. */
-function userPromptText(record: Rec): string | undefined {
+export function userPromptText(record: Rec): string | undefined {
 	if (record.type !== "user") return undefined;
 	const content = (record.message as Rec | undefined)?.content;
 	if (Array.isArray(content) && content.some((b) => (b as Rec)?.type === "tool_result")) return undefined;

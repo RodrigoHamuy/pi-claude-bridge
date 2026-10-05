@@ -1,16 +1,28 @@
-// Isolated compression fork (billion-context-pi #614): runs a pi session's last
-// served request again in a throwaway Claude Code session with one extra prompt,
-// and returns the arguments of the model's first call to one tool.
+// Isolated compression fork (billion-context-pi #614): once the request pi is
+// serving ends in a final answer, Claude Code forks the main session at that
+// answer, runs one extra prompt in the copy, and the arguments of the model's
+// first call to one tool come back.
 //
+// - The copy is Claude Code's own (resume + forkSession + resumeSessionAt), so
+//   its request repeats the main request it was cut from, answer included, and
+//   the fork prompt follows as a message of its own. Cutting before the answer
+//   would merge the prompt into the newest input and send that input again, so
+//   a request that ends on a tool call is not forked.
 // - Never routed through streamSimple: replayed tool results would match the
 //   main query (contextForToolResults) and steer the prompt into it.
-// - Nothing executes: the fork refuses to run where external tools could load,
-//   and its own tool server refuses every call.
-// - The fork session is deleted only once its CC process has exited.
+// - No tool runs: the fork refuses to run where external tools could load, and
+//   its own tool server refuses every call. Hooks from settings files and
+//   plugins are off in the fork; managed-policy hooks still run, and Claude
+//   Code still writes its own state (e.g. ~/.claude.json) as on any query.
+// - The fork's session id is chosen up front and is never the main one; it is
+//   deleted only once its CC process has exited.
 // - pi.events is a synchronous emitter, so the instance that served the session
 //   accepts in the emit tick or there is no fork.
 
+import { randomUUID } from "node:crypto";
 import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { userPromptText } from "./attachments.js";
+import type { ServedInput, ServedReply } from "./query-state.js";
 
 export const ISOLATED_FORK_CHANNEL = "claude-bridge:isolated-fork";
 
@@ -21,7 +33,7 @@ export interface ForkUsage {
 	cacheWrite: number;
 }
 
-export type ForkFailure = "no-capture-tool" | "no-capture" | "unsafe-config" | "unsupported-context" | "aborted" | "error";
+export type ForkFailure = "no-capture-tool" | "no-capture" | "unsafe-config" | "unsupported-context" | "stale-context" | "aborted" | "error";
 
 export type ForkResult =
 	| { ok: true; args: Record<string, unknown>; usage: ForkUsage }
@@ -108,6 +120,8 @@ export class ServedRequests {
 /** A CC message as far as the fork reads it. */
 export interface ForkStreamMessage {
 	type: string;
+	subtype?: unknown;
+	session_id?: unknown;
 	message?: unknown;
 }
 
@@ -125,13 +139,26 @@ export interface ForkProcess {
 	kill(): void;
 }
 
+/** Where the fork copies the main session from. */
+export interface ForkSource {
+	mainSessionId: string;
+	/** Waits, once the fork starts, for the main turn to end in an answer. */
+	forkPoint(signal: AbortSignal): Promise<string>;
+}
+
+export interface ForkTarget {
+	mainSessionId: string;
+	forkSessionId: string;
+	resumeAt: string;
+}
+
 export interface ForkDeps {
 	/** Why this request must not fork, checked before anything is written. */
 	refusal(served: ServedRequest): ForkFailure | undefined;
-	/** Writes the served history into a new CC session and returns its id. May throw ForkRefused. */
-	createSession(served: ServedRequest): string;
-	/** Starts the fork query on `sessionId` with the main query's options. */
-	startQuery(served: ServedRequest, sessionId: string, prompt: string, abortController: AbortController): { query: ForkQuery; process: ForkProcess };
+	/** Called in the emit tick: the main session that holds exactly `served`. */
+	source(served: ServedRequest): ForkSource | ForkFailure;
+	/** Starts the fork query with the main query's options. */
+	startQuery(served: ServedRequest, target: ForkTarget, prompt: string, abortController: AbortController): { query: ForkQuery; process: ForkProcess };
 	/** The SDK-side name CC uses for a pi tool. */
 	sdkToolName(piToolName: string): string;
 	deleteSession(sessionId: string, cwd: string): void;
@@ -160,6 +187,91 @@ function firstToolUse(content: unknown, sdkName: string): Record<string, unknown
 	return undefined;
 }
 
+function holdsToolResult(record: Record<string, unknown>, id: string): boolean {
+	if (record.type !== "user") return false;
+	const content = (record.message as { content?: unknown } | undefined)?.content;
+	return Array.isArray(content) && content.some((b: { type?: unknown; tool_use_id?: unknown } | null) => b?.type === "tool_result" && b.tool_use_id === id);
+}
+
+/** The record holding `input`: the prompt, or the last of its tool results. */
+function inputAt(records: readonly Record<string, unknown>[], input: ServedInput): number | undefined {
+	if (input.kind === "prompt") {
+		const at = records.findIndex((r) => userPromptText(r) === input.text);
+		return at < 0 ? undefined : at;
+	}
+	// Parallel results can sit in separate records; every one must be on disk.
+	let anchor = -1;
+	for (const id of input.ids) {
+		const at = records.findIndex((r) => holdsToolResult(r, id));
+		if (at < 0) return undefined;
+		anchor = Math.max(anchor, at);
+	}
+	return anchor;
+}
+
+/** Where to fork a main transcript that answered `input` with the entry
+ *  `lastUuid`, given the records it wrote from `input.fromByte` on: that entry.
+ *  Undefined until it is on disk, "superseded" when other input reached the
+ *  turn first. */
+export function answerEndIn(records: readonly Record<string, unknown>[], input: ServedInput, lastUuid: string): number | "superseded" | undefined {
+	const anchor = inputAt(records, input);
+	if (anchor === undefined) return undefined;
+	for (let i = anchor + 1; i < records.length; i++) {
+		const r = records[i];
+		if (r.uuid === lastUuid) return r.type === "assistant" ? i : "superseded";
+		const attachment = r.attachment as { type?: unknown } | undefined;
+		if (r.type === "user" || (r.type === "attachment" && attachment?.type === "queued_command")) return "superseded";
+	}
+	return undefined;
+}
+
+/** The main query's view of one served input, read while a fork waits on it. */
+export interface AnswerWatch {
+	reply(): ServedReply | undefined;
+	/** True once the input can no longer get a reply: a newer input, a rewritten
+	 *  history, or another query (or none) holding the session. */
+	superseded(): boolean;
+	records(): readonly Record<string, unknown>[];
+}
+
+export interface AnswerWait {
+	/** For the main turn to end. */
+	replyMs: number;
+	/** For the answer's last entry to reach the transcript once the turn ended. */
+	flushMs: number;
+	pollMs: number;
+}
+
+/** The entry to fork at once the main turn for `input` ends in a final answer.
+ *  Declines a turn that ends on a tool call (`unsupported-context`) or that
+ *  another input overtakes (`stale-context`). */
+export async function waitForAnswerEnd(watch: AnswerWatch, input: ServedInput, signal: AbortSignal, wait: AnswerWait): Promise<string> {
+	const replyDeadline = Date.now() + wait.replyMs;
+	let flushDeadline: number | undefined;
+	for (;;) {
+		if (signal.aborted) throw new ForkRefused("aborted");
+		const reply = watch.reply();
+		if (reply) {
+			if (reply.kind !== "answer") throw new ForkRefused(reply.kind === "toolUse" ? "unsupported-context" : "stale-context");
+			const at = answerEndIn(watch.records(), input, reply.lastUuid);
+			if (at === "superseded") throw new ForkRefused("stale-context");
+			if (at !== undefined) return reply.lastUuid;
+			flushDeadline ??= Date.now() + wait.flushMs;
+			if (Date.now() >= flushDeadline) throw new ForkRefused("unsupported-context");
+		} else if (watch.superseded() || Date.now() >= replyDeadline) {
+			throw new ForkRefused("stale-context");
+		}
+		await new Promise((resolve) => setTimeout(resolve, wait.pollMs));
+	}
+}
+
+/** The main query's settings with hooks from settings files and plugins off.
+ *  Undefined for a settings file path, which cannot be extended unread. */
+export function forkSettings<S extends object>(settings: string | S | undefined): (S & { disableAllHooks: true }) | { disableAllHooks: true } | undefined {
+	if (typeof settings === "string") return undefined;
+	return { ...settings, disableAllHooks: true };
+}
+
 function errorKind(error: unknown): string {
 	return error instanceof Error ? error.name : typeof error;
 }
@@ -185,12 +297,22 @@ export class IsolatedForks {
 		let start!: () => void;
 		const go = new Promise<void>((resolve) => { start = resolve; });
 		const generation = this.generation;
-		const result = go.then(() => (generation === this.generation ? this.run(request, served) : { ok: false as const, reason: "aborted" as const }));
+		const source = this.sourceOf(served);
+		const result = go.then(() => (generation === this.generation ? this.run(request, served, source) : { ok: false as const, reason: "aborted" as const }));
 		if (request.accept(result) === false) return;
 		this.runs.add(result);
 		const forget = () => { this.runs.delete(result); };
 		result.then(forget, forget);
 		start();
+	}
+
+	private sourceOf(served: ServedRequest): ForkSource | ForkFailure {
+		try {
+			return this.deps.source(served);
+		} catch (error) {
+			this.deps.debug(`isolated-fork: source failed: ${errorKind(error)}`);
+			return "error";
+		}
 	}
 
 	/** Stops running forks, and accepted ones that have not started yet. */
@@ -220,13 +342,14 @@ export class IsolatedForks {
 		if (this.unsettled.size > 0) this.deps.debug(`isolated-fork: shutdown left ${this.unsettled.size} session(s) whose process did not exit`);
 	}
 
-	private async run(request: ForkRequest, served: ServedRequest): Promise<ForkResult> {
+	private async run(request: ForkRequest, served: ServedRequest, source: ForkSource | ForkFailure): Promise<ForkResult> {
 		if (request.signal.aborted) return { ok: false, reason: "aborted" };
 		if (!served.context.tools?.some((tool) => tool.name === request.captureTool)) {
 			return { ok: false, reason: "no-capture-tool" };
 		}
 		const refusal = this.deps.refusal(served);
 		if (refusal) return { ok: false, reason: refusal };
+		if (typeof source === "string") return { ok: false, reason: source };
 
 		const controller = new AbortController();
 		let wake!: () => void;
@@ -244,14 +367,23 @@ export class IsolatedForks {
 		let args: Record<string, unknown> | undefined;
 		const withUsage = () => (usage ? { usage } : {});
 		try {
-			sessionId = this.deps.createSession(served);
+			const resumeAt = await source.forkPoint(controller.signal);
 			if (controller.signal.aborted) return { ok: false, reason: "aborted" };
+			const forkSessionId = randomUUID();
+			if (forkSessionId === source.mainSessionId) return { ok: false, reason: "error" };
 			const sdkName = this.deps.sdkToolName(request.captureTool);
-			started = this.deps.startQuery(served, sessionId, request.prompt, controller);
+			sessionId = forkSessionId;
+			started = this.deps.startQuery(served, { mainSessionId: source.mainSessionId, forkSessionId, resumeAt }, request.prompt, controller);
 			const q = started.query;
 			consumed = (async () => {
 				for await (const message of q) {
 					if (controller.signal.aborted) return;
+					if (message.type === "system" && message.subtype === "init") {
+						if (message.session_id === forkSessionId) continue;
+						// Not a session this fork owns, so it is left alone.
+						this.deps.debug("isolated-fork: init named a session other than the fork's");
+						throw new ForkRefused("error");
+					}
 					if (message.type !== "assistant") continue;
 					const body = message.message && typeof message.message === "object" ? message.message as { content?: unknown; usage?: unknown } : {};
 					usage ??= usageOf(body.usage);
