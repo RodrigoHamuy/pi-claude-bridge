@@ -22,7 +22,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
 import { getProjectDir, getSessionPath, openSession } from "cc-session-io";
-import { answerEndIn, ForkRefused, forkSettings, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, parseForkRequest, waitForAnswerEnd } from "../src/isolated-fork.js";
+import { answerEndIn, ForkRefused, forkSettings, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, parseForkRequest, toolResultCutIn, waitForAnswerEnd, waitForToolResultCut } from "../src/isolated-fork.js";
 
 const claudeDir = mkdtempSync(join(tmpdir(), "claude-bridge-isolated-fork-cc-"));
 process.env.CLAUDE_CONFIG_DIR = claudeDir;
@@ -177,6 +177,63 @@ describe("waitForAnswerEnd", () => {
 	});
 });
 
+describe("toolResultCutIn", () => {
+	const result = (ids, uuid) => ({ type: "user", uuid, message: { role: "user", content: ids.map((id) => ({ type: "tool_result", tool_use_id: id, content: "x" })) } });
+	const attachment = (uuid, type = "date") => ({ type: "attachment", uuid, attachment: { type } });
+	const reply = (uuid) => ({ type: "assistant", uuid, message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+	const input = { kind: "toolResults", ids: ["trig", "t2"], fromByte: 0 };
+
+	it("cuts after the last of the input's results and the attachments written with them, settled once the next record follows", () => {
+		assert.deepEqual(toolResultCutIn([result(["trig"], "r1"), result(["t2"], "r2"), attachment("a1"), attachment("a2"), reply("next")], input), { uuid: "a2", settled: true });
+		assert.deepEqual(toolResultCutIn([result(["trig", "t2"], "r"), attachment("a")], input), { uuid: "a", settled: false }, "more attachments may still come");
+		assert.deepEqual(toolResultCutIn([result(["trig", "t2"], "r"), { type: "user", uuid: "steer", message: { role: "user", content: "also" } }], input), { uuid: "r", settled: true }, "never past the next input");
+	});
+
+	it("is undefined until every result of the input is on disk, and superseded when a queued command came with them", () => {
+		assert.equal(toolResultCutIn([result(["trig"], "r1")], input), undefined);
+		assert.equal(toolResultCutIn([result(["trig", "t2"], "r"), attachment("q", "queued_command")], input), "superseded");
+	});
+});
+
+describe("waitForToolResultCut", () => {
+	const input = { kind: "toolResults", ids: ["trig"], fromByte: 0 };
+	const resultRecord = { type: "user", uuid: "r", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "trig", content: "queued" }] } };
+	const wait = { cutMs: 500, settleMs: 40, pollMs: 5 };
+	const watch = (records, over = {}) => ({ reply: () => undefined, superseded: () => false, records: () => records, ...over });
+	const refusal = (promise) => promise.then(() => assert.fail("expected a refusal"), (error) => { assert.ok(error instanceof ForkRefused, String(error)); return error.reason; });
+
+	it("returns the cut without waiting for the main turn to answer", async () => {
+		const settled = [resultRecord, { type: "assistant", uuid: "a", message: { role: "assistant", content: [] } }];
+		assert.equal(await waitForToolResultCut(watch(settled, { reply: () => assert.fail("must not wait for the reply") }), input, "trig", new AbortController().signal, wait), "r");
+		const started = Date.now();
+		assert.equal(await waitForToolResultCut(watch([resultRecord]), input, "trig", new AbortController().signal, wait), "r", "an unsettled cut is taken once no attachment follows within settleMs");
+		assert.ok(Date.now() - started >= 30);
+	});
+
+	it("still cuts when the main query moved on after the result reached the transcript", async () => {
+		assert.equal(await waitForToolResultCut(watch([resultRecord], { superseded: () => true }), input, "trig", new AbortController().signal, wait), "r");
+	});
+
+	it("declines input that does not deliver the trigger's result, without reading the transcript", async () => {
+		const unread = { records: () => assert.fail("read the transcript") };
+		assert.equal(await refusal(waitForToolResultCut(watch([], unread), input, "other", new AbortController().signal, wait)), "unsupported-context");
+		assert.equal(await refusal(waitForToolResultCut(watch([], unread), { kind: "prompt", text: "go", fromByte: 0 }, "trig", new AbortController().signal, wait)), "unsupported-context");
+	});
+
+	it("declines a history rewritten before the result is on disk, and a result that never arrives within its deadline from the start", async () => {
+		assert.equal(await refusal(waitForToolResultCut(watch([], { superseded: () => true }), input, "trig", new AbortController().signal, wait)), "stale-context");
+		const started = Date.now();
+		assert.equal(await refusal(waitForToolResultCut(watch([]), input, "trig", new AbortController().signal, { ...wait, cutMs: 60 })), "cut-timeout");
+		assert.ok(Date.now() - started < 1_000);
+	});
+
+	it("stops on abort", async () => {
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 20);
+		assert.equal(await refusal(waitForToolResultCut(watch([]), input, "trig", controller.signal, { ...wait, cutMs: 5_000 })), "aborted");
+	});
+});
+
 describe("forkSettings", () => {
 	it("turns hooks off on a copy of the main query's settings object, and has no fork for a settings file path", () => {
 		const main = { autoMemoryEnabled: false, claudeMdExcludes: ["x"] };
@@ -194,7 +251,9 @@ describe("parseForkRequest", () => {
 			null, "x", { ...request().data, version: 2 }, { ...request().data, piSessionId: "" },
 			{ ...request().data, prompt: 1 }, { ...request().data, captureTool: "" },
 			{ ...request().data, signal: {} }, { ...request().data, accept: undefined },
+			{ ...request().data, cutAfterToolResult: "" }, { ...request().data, cutAfterToolResult: 7 },
 		]) assert.equal(parseForkRequest(bad), undefined);
+		assert.equal(parseForkRequest(request({ cutAfterToolResult: "toolu_1" }).data).cutAfterToolResult, "toolu_1");
 	});
 });
 
@@ -507,7 +566,7 @@ describe("isolated fork through the provider", async () => {
 	const cwd = process.cwd();
 
 	// Exactly what billion-context-pi's AsyncCompressor emits (src/async-compress.ts launchBridge).
-	function acpRequest(piSessionId) {
+	function acpRequest(piSessionId, cutAfterToolResult) {
 		let accepted;
 		const controller = new AbortController();
 		bus.emit(ISOLATED_FORK_CHANNEL, {
@@ -515,6 +574,7 @@ describe("isolated fork through the provider", async () => {
 			piSessionId,
 			prompt: "NUDGE",
 			captureTool: "compress",
+			...(cutAfterToolResult ? { cutAfterToolResult } : {}),
 			signal: controller.signal,
 			accept: (result) => {
 				if (!result || typeof result.then !== "function") return false;
@@ -534,6 +594,7 @@ describe("isolated fork through the provider", async () => {
 		__test.resetSharedSession();
 		__test.setProviderSettings({});
 		__test.setForkAnswerWait({ replyMs: 3_000, flushMs: 300, pollMs: 10 });
+		__test.setForkCutWait({ cutMs: 2_000, settleMs: 50, pollMs: 10 });
 		queries.length = 0;
 		scripts.length = 0;
 		__test.setQuery(({ options, prompt }) => {
@@ -559,6 +620,7 @@ describe("isolated fork through the provider", async () => {
 		__test.setQuery(null);
 		__test.setProviderSettings({});
 		__test.setForkAnswerWait(null);
+		__test.setForkCutWait(null);
 	});
 
 	let clock = 0;
@@ -837,6 +899,42 @@ describe("isolated fork through the provider", async () => {
 			const fork = queries.at(-1);
 			assert.equal(fork.options.resume, t.mainId);
 			assert.equal(fork.options.resumeSessionAt, t.answer);
+		});
+
+		it("with cutAfterToolResult, forks right after the delivered result while the main turn keeps running, and leaves the main session alone", async () => {
+			const t = await parkOnTool("pi-cut", "toolu_c");
+			const delivery = streamSimple(model, { systemPrompt: undefined, messages: [...t.before, t.call, t.result], tools }, { sessionId: "pi-cut" });
+			await settle();
+			const resultUuid = appendRecord(t.mainId, { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_c", content: "queued" }] } });
+			const attachmentUuid = appendRecord(t.mainId, { type: "attachment", attachment: { type: "date" } });
+			const mainBytes = bytesOf(t.mainId);
+			scripts.push(forkScript());
+			const result = await acpRequest("pi-cut", "toolu_c").accepted;
+			assert.deepEqual(result.ok && result.args, { startId: "m00001" }, "the fork finished before the main turn answered");
+			const fork = queries.at(-1);
+			assert.equal(fork.label, "fork");
+			assert.equal(fork.options.resume, t.mainId);
+			assert.equal(fork.options.forkSession, true);
+			assert.notEqual(fork.options.sessionId, t.mainId);
+			assert.equal(fork.options.resumeSessionAt, attachmentUuid, "after the result and the attachment written with it");
+			assert.notEqual(resultUuid, attachmentUuid);
+			const main = queries.find((q) => q.label === "main:pi-cut");
+			assert.equal(main.closed + main.interrupted, 0, "the main query is not stopped or held");
+			assert.equal(bytesOf(t.mainId), mainBytes, "the fork never writes the main transcript");
+			t.held.open();
+			await delivery.result();
+		});
+
+		it("with cutAfterToolResult, declines a request that does not deliver that result, and a result that never reaches the transcript", async () => {
+			const t = await parkOnTool("pi-cut-other", "toolu_d");
+			const delivery = streamSimple(model, { systemPrompt: undefined, messages: [...t.before, t.call, t.result], tools }, { sessionId: "pi-cut-other" });
+			await settle();
+			assert.deepEqual(await acpRequest("pi-cut-other", "toolu_elsewhere").accepted, { ok: false, reason: "unsupported-context" });
+			__test.setForkCutWait({ cutMs: 80, settleMs: 20, pollMs: 10 });
+			assert.deepEqual(await acpRequest("pi-cut-other", "toolu_d").accepted, { ok: false, reason: "cut-timeout" }, "the result record was never written");
+			assert.equal(queries.at(-1).label, "main:pi-cut-other", "nothing started");
+			t.held.open();
+			await delivery.result();
 		});
 
 		it("refuses when a steer came with the tool result, since its place in the transcript is Claude Code's", async () => {

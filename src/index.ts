@@ -30,7 +30,7 @@ import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, reso
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { fingerprintPriors } from "./priors-fingerprint.js";
-import { ForkRefused, forkSettings, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, waitForAnswerEnd, type AnswerWait, type ForkFailure, type ForkProcess, type ForkSource, type ServedRequest } from "./isolated-fork.js";
+import { ForkRefused, forkSettings, IsolatedForks, ISOLATED_FORK_CHANNEL, ServedRequests, waitForAnswerEnd, waitForToolResultCut, type AnswerWait, type CutWait, type ForkFailure, type ForkProcess, type ForkSource, type ServedRequest } from "./isolated-fork.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -906,6 +906,9 @@ export const __test = {
 	get isolatedForks() { return isolatedForks; },
 	setForkAnswerWait(wait: AnswerWait | null) {
 		forkAnswerWait = wait ?? FORK_ANSWER_WAIT;
+	},
+	setForkCutWait(wait: CutWait | null) {
+		forkCutWait = wait ?? FORK_CUT_WAIT;
 	},
 	setProviderSettings(settings: NonNullable<Config["provider"]>) {
 		providerSettings = settings;
@@ -1833,6 +1836,8 @@ const isolatedForks = new IsolatedForks(servedRequests, {
  *  the fork; a turn that ended gets this long to reach the transcript. */
 const FORK_ANSWER_WAIT: AnswerWait = { replyMs: 5 * 60_000, flushMs: 2_000, pollMs: 50 };
 let forkAnswerWait = FORK_ANSWER_WAIT;
+const FORK_CUT_WAIT: CutWait = { cutMs: 10_000, settleMs: 1_000, pollMs: 50 };
+let forkCutWait = FORK_CUT_WAIT;
 
 /** The main query serving `served`, if its CLI holds exactly that history. The
  *  query, its input and its history are taken now: a later input, a rewrite or
@@ -1853,7 +1858,12 @@ function forkSource(served: ServedRequest): ForkSource | ForkFailure {
 		superseded: () => c.servedInput !== input || c.historyStale || c.activeQuery !== owner,
 		records: () => recordsFrom(mainSessionId, served.cwd, input.fromByte),
 	};
-	return { mainSessionId, forkPoint: (signal) => waitForAnswerEnd(watch, input, signal, forkAnswerWait) };
+	return {
+		mainSessionId,
+		forkPoint: (signal, cutAfterToolResult) => cutAfterToolResult === undefined
+			? waitForAnswerEnd(watch, input, signal, forkAnswerWait)
+			: waitForToolResultCut(watch, input, cutAfterToolResult, signal, forkCutWait),
+	};
 }
 
 function transcriptSize(sessionId: string, cwd: string): number {

@@ -1,13 +1,15 @@
-// Isolated compression fork (billion-context-pi #614): once the request pi is
-// serving ends in a final answer, Claude Code forks the main session at that
-// answer, runs one extra prompt in the copy, and the arguments of the model's
-// first call to one tool come back.
+// Isolated compression fork (billion-context-pi #614): Claude Code forks the
+// main session, runs one extra prompt in the copy, and the arguments of the
+// model's first call to one tool come back. Where the copy is cut:
+//
+// - `cutAfterToolResult`: right after that call's result in the request being
+//   served, plus the attachments written with it. The main turn keeps running.
+// - Otherwise once that request ends in a final answer, at the answer; a
+//   request that ends on a tool call is not forked.
 //
 // - The copy is Claude Code's own (resume + forkSession + resumeSessionAt), so
-//   its request repeats the main request it was cut from, answer included, and
-//   the fork prompt follows as a message of its own. Cutting before the answer
-//   would merge the prompt into the newest input and send that input again, so
-//   a request that ends on a tool call is not forked.
+//   its request repeats the main request up to the cut, and the fork prompt
+//   follows it.
 // - Never routed through streamSimple: replayed tool results would match the
 //   main query (contextForToolResults) and steer the prompt into it.
 // - No tool runs: the fork refuses to run where external tools could load, and
@@ -33,7 +35,7 @@ export interface ForkUsage {
 	cacheWrite: number;
 }
 
-export type ForkFailure = "no-capture-tool" | "no-capture" | "unsafe-config" | "unsupported-context" | "stale-context" | "aborted" | "error";
+export type ForkFailure = "no-capture-tool" | "no-capture" | "unsafe-config" | "unsupported-context" | "stale-context" | "cut-timeout" | "aborted" | "error";
 
 export type ForkResult =
 	| { ok: true; args: Record<string, unknown>; usage: ForkUsage }
@@ -44,6 +46,8 @@ export interface ForkRequest {
 	piSessionId: string;
 	prompt: string;
 	captureTool: string;
+	/** Cut right after this tool call's result instead of after the answer. */
+	cutAfterToolResult?: string;
 	signal: AbortSignal;
 	/** `false` means another acceptor was taken first. */
 	accept(result: Promise<ForkResult>): unknown;
@@ -73,6 +77,7 @@ export function parseForkRequest(data: unknown): ForkRequest | undefined {
 	if (typeof r.piSessionId !== "string" || !r.piSessionId) return undefined;
 	if (typeof r.prompt !== "string" || !r.prompt) return undefined;
 	if (typeof r.captureTool !== "string" || !r.captureTool) return undefined;
+	if (r.cutAfterToolResult !== undefined && (typeof r.cutAfterToolResult !== "string" || !r.cutAfterToolResult)) return undefined;
 	if (!(r.signal instanceof AbortSignal)) return undefined;
 	if (typeof r.accept !== "function") return undefined;
 	return r as unknown as ForkRequest;
@@ -142,8 +147,9 @@ export interface ForkProcess {
 /** Where the fork copies the main session from. */
 export interface ForkSource {
 	mainSessionId: string;
-	/** Waits, once the fork starts, for the main turn to end in an answer. */
-	forkPoint(signal: AbortSignal): Promise<string>;
+	/** Waits, once the fork starts, for the entry to cut at: after the result for
+	 *  `cutAfterToolResult`, or else the answer that ends the main turn. */
+	forkPoint(signal: AbortSignal, cutAfterToolResult?: string): Promise<string>;
 }
 
 export interface ForkTarget {
@@ -225,6 +231,27 @@ export function answerEndIn(records: readonly Record<string, unknown>[], input: 
 	return undefined;
 }
 
+/** Where to cut after the served input's tool results: the last record holding
+ *  one of them, or a later attachment Claude Code wrote with them, before the
+ *  next user or assistant record. `settled` once such a record follows.
+ *  Undefined until every result is on disk; "superseded" if a queued command
+ *  arrived with them. */
+export function toolResultCutIn(records: readonly Record<string, unknown>[], input: ServedInput): { uuid: string; settled: boolean } | "superseded" | undefined {
+	const anchor = inputAt(records, input);
+	if (anchor === undefined) return undefined;
+	let cut = anchor;
+	for (let i = anchor + 1; i < records.length; i++) {
+		const r = records[i];
+		if (r.type === "attachment") {
+			if ((r.attachment as { type?: unknown } | undefined)?.type === "queued_command") return "superseded";
+			cut = i;
+		} else if (r.type === "user" || r.type === "assistant") {
+			return typeof records[cut].uuid === "string" ? { uuid: records[cut].uuid as string, settled: true } : undefined;
+		}
+	}
+	return typeof records[cut].uuid === "string" ? { uuid: records[cut].uuid as string, settled: false } : undefined;
+}
+
 /** The main query's view of one served input, read while a fork waits on it. */
 export interface AnswerWatch {
 	reply(): ServedReply | undefined;
@@ -260,6 +287,38 @@ export async function waitForAnswerEnd(watch: AnswerWatch, input: ServedInput, s
 			if (Date.now() >= flushDeadline) throw new ForkRefused("unsupported-context");
 		} else if (watch.superseded() || Date.now() >= replyDeadline) {
 			throw new ForkRefused("stale-context");
+		}
+		await new Promise((resolve) => setTimeout(resolve, wait.pollMs));
+	}
+}
+
+export interface CutWait {
+	/** For the results to reach the transcript, from when the fork starts. */
+	cutMs: number;
+	/** For later attachments once the results are there. */
+	settleMs: number;
+	pollMs: number;
+}
+
+/** The entry to fork at, right after the served input's result for
+ *  `toolCallId`. Declines input that does not deliver that result
+ *  (`unsupported-context`), a rewritten or overtaken history (`stale-context`),
+ *  and results that do not reach the transcript in time (`cut-timeout`). */
+export async function waitForToolResultCut(watch: AnswerWatch, input: ServedInput, toolCallId: string, signal: AbortSignal, wait: CutWait): Promise<string> {
+	if (input.kind !== "toolResults" || !input.ids.includes(toolCallId)) throw new ForkRefused("unsupported-context");
+	const deadline = Date.now() + wait.cutMs;
+	let anchoredAt: number | undefined;
+	for (;;) {
+		if (signal.aborted) throw new ForkRefused("aborted");
+		const at = toolResultCutIn(watch.records(), input);
+		if (at === "superseded") throw new ForkRefused("stale-context");
+		if (at) {
+			anchoredAt ??= Date.now();
+			if (at.settled || Date.now() - anchoredAt >= wait.settleMs) return at.uuid;
+		} else if (watch.superseded()) {
+			throw new ForkRefused("stale-context");
+		} else if (Date.now() >= deadline) {
+			throw new ForkRefused("cut-timeout");
 		}
 		await new Promise((resolve) => setTimeout(resolve, wait.pollMs));
 	}
@@ -367,7 +426,7 @@ export class IsolatedForks {
 		let args: Record<string, unknown> | undefined;
 		const withUsage = () => (usage ? { usage } : {});
 		try {
-			const resumeAt = await source.forkPoint(controller.signal);
+			const resumeAt = await source.forkPoint(controller.signal, request.cutAfterToolResult);
 			if (controller.signal.aborted) return { ok: false, reason: "aborted" };
 			const forkSessionId = randomUUID();
 			if (forkSessionId === source.mainSessionId) return { ok: false, reason: "error" };
