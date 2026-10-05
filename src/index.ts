@@ -1818,7 +1818,7 @@ const isolatedForks = new IsolatedForks(servedRequests, {
 			debugTag: "isolated-fork",
 		});
 		const watched = watchedSpawn();
-		const forkQuery = queryImpl({ prompt, options: { ...queryOptions, abortController, maxTurns: 2, spawnClaudeCodeProcess: watched.spawn } });
+		const forkQuery = queryImpl({ prompt, options: { ...queryOptions, abortController, maxTurns: 1, spawnClaudeCodeProcess: watched.spawn } });
 		return { query: forkQuery, process: watched.process };
 	},
 	sdkToolName: (piToolName) => `${MCP_TOOL_PREFIX}${piToolName}`,
@@ -1840,6 +1840,10 @@ function readForkSource(served: ServedRequest): { carried: CarriedAttachment[]; 
 }
 
 const FORK_KILL_AFTER_MS = 10_000;
+// pi awaits session_shutdown handlers, including on SIGTERM, so a fork's
+// session can still be deleted before the process exits.
+const FORK_SHUTDOWN_KILL_MS = 2_000;
+const FORK_SHUTDOWN_DEADLINE_MS = 4_000;
 
 /** A spawner that reports when the fork's CC process has exited — the SDK's own
  *  close() returns before that — and refuses to start one after close. */
@@ -1871,6 +1875,12 @@ function watchedSpawn(): { spawn: NonNullable<NonNullable<Parameters<typeof quer
 				const timer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, FORK_KILL_AFTER_MS);
 				timer.unref();
 				proc.once("exit", () => clearTimeout(timer));
+			},
+			kill() {
+				closed = true;
+				const proc = child;
+				if (!proc) exit();
+				else if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
 			},
 		},
 	};
@@ -2677,9 +2687,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");
+		await isolatedForks.shutdown(FORK_SHUTDOWN_DEADLINE_MS, FORK_SHUTDOWN_KILL_MS);
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {

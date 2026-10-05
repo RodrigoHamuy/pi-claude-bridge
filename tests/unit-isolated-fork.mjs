@@ -446,7 +446,7 @@ describe("isolated fork through the provider", async () => {
 		assert.equal(fork.prompt, "NUDGE");
 		assert.notEqual(fork.options.resume, main.query.options.resume);
 		assert.notEqual(fork.options.resume, mainShared.sessionId);
-		assert.equal(fork.options.maxTurns, 2);
+		assert.equal(fork.options.maxTurns, 1, "one turn: a second one would answer the refused tool call upstream");
 		assert.ok(fork.options.abortController instanceof AbortController);
 		assert.equal(typeof fork.options.spawnClaudeCodeProcess, "function");
 		assert.equal(main.query.options.spawnClaudeCodeProcess, undefined, "the main query keeps the SDK's own spawner");

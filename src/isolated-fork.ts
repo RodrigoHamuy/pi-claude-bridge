@@ -121,6 +121,8 @@ export interface ForkProcess {
 	 *  The SDK's own close() returns before that, while CC may still write the session. */
 	readonly exited: Promise<void>;
 	close(): void;
+	/** SIGKILL now, for a shutdown that cannot wait for `close`'s own timer. */
+	kill(): void;
 }
 
 export interface ForkDeps {
@@ -165,6 +167,9 @@ function errorKind(error: unknown): string {
 /** Owns every fork this bridge instance started, so shutdown can stop them. */
 export class IsolatedForks {
 	private readonly running = new Set<() => void>();
+	private readonly runs = new Set<Promise<unknown>>();
+	private generation = 0;
+	private readonly settling = new Map<Promise<void>, () => void>();
 	private readonly handled = new WeakSet<object>();
 	readonly unsettled = new Set<string>();
 
@@ -179,13 +184,40 @@ export class IsolatedForks {
 		this.handled.add(request);
 		let start!: () => void;
 		const go = new Promise<void>((resolve) => { start = resolve; });
-		const result = go.then(() => this.run(request, served));
+		const generation = this.generation;
+		const result = go.then(() => (generation === this.generation ? this.run(request, served) : { ok: false as const, reason: "aborted" as const }));
 		if (request.accept(result) === false) return;
+		this.runs.add(result);
+		const forget = () => { this.runs.delete(result); };
+		result.then(forget, forget);
 		start();
 	}
 
+	/** Stops running forks, and accepted ones that have not started yet. */
 	abortAll(): void {
+		this.generation++;
 		for (const abort of this.running) abort();
+	}
+
+	/** Stops every fork and waits, at most `deadlineMs`, for each process to exit
+	 *  and its session to be deleted. Processes still running at `killAfterMs`
+	 *  get SIGKILL. A session whose process never exits is left on disk. */
+	async shutdown(deadlineMs: number, killAfterMs: number): Promise<void> {
+		this.abortAll();
+		const start = Date.now();
+		const within = async (promises: Promise<unknown>[], ms: number) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			await Promise.race([
+				Promise.allSettled(promises),
+				new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.max(0, ms)); }),
+			]);
+			clearTimeout(timer);
+		};
+		await within([...this.runs], killAfterMs);
+		await within([...this.settling.keys()], killAfterMs - (Date.now() - start));
+		for (const kill of this.settling.values()) kill();
+		await within([...this.runs, ...this.settling.keys()], deadlineMs - (Date.now() - start));
+		if (this.unsettled.size > 0) this.deps.debug(`isolated-fork: shutdown left ${this.unsettled.size} session(s) whose process did not exit`);
 	}
 
 	private async run(request: ForkRequest, served: ServedRequest): Promise<ForkResult> {
@@ -238,13 +270,15 @@ export class IsolatedForks {
 			this.deps.debug(`isolated-fork: failed (${errorKind(error)})`);
 			return { ok: false, reason: controller.signal.aborted ? "aborted" : "error", ...withUsage() };
 		} finally {
+			// The result is known, so stop the process instead of waiting for it.
+			controller.abort();
 			request.signal.removeEventListener("abort", abort);
 			this.running.delete(abort);
-			this.cleanup(served.cwd, sessionId, started, consumed);
+			this.cleanup(served.cwd, sessionId, started);
 		}
 	}
 
-	private cleanup(cwd: string, sessionId: string | undefined, started: ReturnType<ForkDeps["startQuery"]> | undefined, consumed: Promise<void> | undefined): void {
+	private cleanup(cwd: string, sessionId: string | undefined, started: ReturnType<ForkDeps["startQuery"]> | undefined): void {
 		try {
 			started?.query.close();
 		} catch {}
@@ -266,6 +300,11 @@ export class IsolatedForks {
 			remove();
 			return;
 		}
-		void Promise.all([consumed?.catch(() => {}), started.process.exited]).then(remove);
+		const child = started.process;
+		// Only the process writes the session, so its exit is what deletion waits for.
+		const settled = child.exited.then(remove);
+		this.settling.set(settled, () => child.kill());
+		const forget = () => { this.settling.delete(settled); };
+		settled.then(forget, forget);
 	}
 }
