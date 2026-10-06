@@ -1157,16 +1157,85 @@ describe("IsolatedForks usage", () => {
 		assert.deepEqual(result, { ok: true, args: { startId: "m1" } });
 	});
 
-	it("stops at anything but the captured response's own records, such as the refused tool's result", async () => {
+	it("stops at a tool result when the captured call carries no id to match it against", async () => {
 		const { result, pulled } = await fork((target, pulled) => [
 			init(target),
 			start("msg_A", startUsage),
 			record("msg_A", [compress({ startId: "m1" })]),
-			{ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "refused" }] } },
+			{ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "refused", is_error: true }] } },
 			after(pulled, "past the tool result"),
 			delta({ output_tokens: 543 }),
 		]);
 		assert.equal(result.usage.complete, false);
 		assert.deepEqual(pulled, []);
+	});
+
+	const callId = "toolu_captured";
+	const captured = (input) => ({ ...compress(input), id: callId });
+	const resultOf = (blocks) => ({ type: "user", message: { role: "user", content: blocks } });
+	const refusal = (id = callId) => ({ type: "tool_result", tool_use_id: id, content: "Tool execution is disabled in this compression fork.", is_error: true });
+
+	it("reads past the captured call's own refusal to its response's final usage, as live Claude Code orders them", async () => {
+		const { result, pulled } = await fork((target, pulled) => [
+			init(target),
+			start("msg_A", startUsage),
+			record("msg_A", [captured({ startId: "m1" })]),
+			resultOf([refusal()]),
+			delta({ output_tokens: 578 }),
+			after(pulled, "past message_delta"),
+			stop,
+		]);
+		assert.deepEqual(result, { ok: true, args: { startId: "m1" }, usage: { input: 50, output: 578, cacheRead: 1000, cacheWrite: 20, complete: true } });
+		assert.deepEqual(pulled, []);
+	});
+
+	for (const [label, blocks] of [
+		["another call's result", [refusal("toolu_other")]],
+		["a result that is not a refusal", [{ ...refusal(), is_error: false }]],
+		["the refusal next to another call's result", [refusal(), refusal("toolu_other")]],
+		["a record with no results", []],
+	]) {
+		it(`stops at ${label} after the capture`, async () => {
+			const { result, pulled } = await fork((target, pulled) => [
+				init(target),
+				start("msg_A", startUsage),
+				record("msg_A", [captured({ startId: "m1" })]),
+				resultOf(blocks),
+				after(pulled, "past the record"),
+				delta({ output_tokens: 578 }),
+			]);
+			assert.deepEqual(result.usage, { input: 50, output: 3, cacheRead: 1000, cacheWrite: 20, complete: false }, label);
+			assert.deepEqual(pulled, [], label);
+		});
+	}
+
+	it("stops at a new response after the refusal, never crediting its usage to the captured one", async () => {
+		const { result, pulled } = await fork((target, pulled) => [
+			init(target),
+			start("msg_A", startUsage),
+			record("msg_A", [captured({ startId: "m1" })]),
+			resultOf([refusal()]),
+			start("msg_B", { input_tokens: 7, output_tokens: 1 }),
+			after(pulled, "past the new response"),
+			delta({ output_tokens: 40 }),
+		]);
+		assert.deepEqual(result.usage, { input: 50, output: 3, cacheRead: 1000, cacheWrite: 20, complete: false });
+		assert.deepEqual(pulled, []);
+	});
+
+	it("bounds the wait past the refusal by usageWaitMs, without extending it", async () => {
+		const { result, ms, log } = await fork((target) => [init(target), start("msg_A", startUsage), record("msg_A", [captured({ startId: "m1" })]), resultOf([refusal()]), never()], { extra: { usageWaitMs: 60 } });
+		assert.deepEqual(result, { ok: true, args: { startId: "m1" }, usage: { input: 50, output: 3, cacheRead: 1000, cacheWrite: 20, complete: false } });
+		assert.ok(ms >= 50 && ms < 1_500, `bounded by usageWaitMs (${ms} ms)`);
+		assert.equal(log.processClosed, 1);
+	});
+
+	it("stops waiting past the refusal when the caller aborts", async () => {
+		const { result, ms, log } = await fork((target) => [init(target), start("msg_A", startUsage), record("msg_A", [captured({ startId: "m1" })]), resultOf([refusal()]), never()], {
+			during: (r) => setTimeout(() => r.controller.abort(), 30),
+		});
+		assert.deepEqual(result, { ok: false, reason: "aborted", usage: { input: 50, output: 3, cacheRead: 1000, cacheWrite: 20, complete: false } });
+		assert.ok(ms < 1_500, `${ms} ms`);
+		assert.equal(log.processClosed, 1);
 	});
 });

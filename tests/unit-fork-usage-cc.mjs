@@ -28,10 +28,13 @@ const project = join(root, "project");
 for (const dir of [configDir, project, join(root, "tmp")]) mkdirSync(dir, { recursive: true });
 
 const bodies = [];
+// Live Claude Code can run the refusing handler, and record its result, before the
+// response's message_delta arrives; a pause before that event reproduces the order.
+let deltaDelayMs = 0;
 const upstream = createServer((req, res) => {
 	let body = "";
 	req.on("data", (chunk) => { body += chunk; });
-	req.on("end", () => {
+	req.on("end", async () => {
 		if (!req.url?.startsWith("/v1/messages") || req.url.includes("count_tokens")) {
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end('{"input_tokens":1}');
@@ -54,7 +57,10 @@ const upstream = createServer((req, res) => {
 			{ type: "message_stop" },
 		];
 		res.writeHead(200, { "content-type": "text/event-stream" });
-		for (const event of events) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+		for (const event of events) {
+			if (event.type === "message_delta" && deltaDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, deltaDelayMs));
+			res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+		}
 		res.end();
 	});
 });
@@ -99,7 +105,9 @@ function ownedSpawn() {
 
 const compressTool = { name: "compress", description: "Compress", parameters: { type: "object", properties: { startId: { type: "string" }, endId: { type: "string" }, summary: { type: "string" } } } };
 
-test("a fork against the real CLI reports the response's final usage, with no second request", { timeout: 120_000 }, async () => {
+async function forkAgainstCli({ delayMs }) {
+	bodies.length = 0;
+	deltaDelayMs = delayMs;
 	const handled = [];
 	const owned = ownedSpawn();
 	let forkAbort;
@@ -157,9 +165,19 @@ test("a fork against the real CLI reports the response's final usage, with no se
 		assert.ok(exitedInTime, "the fork's CLI exited after the capture");
 		assert.equal(bodies.length, 1, "the fork made exactly one model request");
 		assert.ok(handled.every((id) => id === "toolu_fork_1"), "only the refusing handler could ever be reached");
-		console.log(`# refusing handler calls: ${handled.length}`);
+		return handled;
 	} finally {
 		forkAbort?.abort();
 		owned.kill();
 	}
+}
+
+test("a fork against the real CLI reports the response's final usage, with no second request", { timeout: 120_000 }, async () => {
+	const handled = await forkAgainstCli({ delayMs: 0 });
+	console.log(`# refusing handler calls: ${handled.length}`);
+});
+
+test("the final usage still counts when the refused call's result comes before the response's message_delta", { timeout: 120_000 }, async () => {
+	const handled = await forkAgainstCli({ delayMs: 400 });
+	assert.deepEqual(handled, ["toolu_fork_1"], "the CLI ran the refusing handler before the final usage arrived");
 });

@@ -206,15 +206,23 @@ function usageOf(usage: unknown, base?: ForkUsage): ForkUsage | undefined {
 /** How long a captured call waits for its response's final usage. */
 export const FORK_USAGE_WAIT_MS = 2_000;
 
-function firstToolUse(content: unknown, sdkName: string): Record<string, unknown> | undefined {
+function firstToolUse(content: unknown, sdkName: string): { args: Record<string, unknown>; id?: string } | undefined {
 	if (!Array.isArray(content)) return undefined;
 	for (const block of content) {
 		if (!block || typeof block !== "object") continue;
-		const b = block as { type?: unknown; name?: unknown; input?: unknown };
+		const b = block as { type?: unknown; name?: unknown; input?: unknown; id?: unknown };
 		if (b.type !== "tool_use" || b.name !== sdkName) continue;
-		return b.input && typeof b.input === "object" && !Array.isArray(b.input) ? b.input as Record<string, unknown> : {};
+		const args = b.input && typeof b.input === "object" && !Array.isArray(b.input) ? b.input as Record<string, unknown> : {};
+		return typeof b.id === "string" ? { args, id: b.id } : { args };
 	}
 	return undefined;
+}
+
+/** A record holding nothing but the refused result of the call `id`. */
+function onlyRefusalOf(record: { type?: unknown; message?: unknown }, id: string): boolean {
+	if (record.type !== "user") return false;
+	const content = (record.message as { content?: unknown } | undefined)?.content;
+	return Array.isArray(content) && content.length > 0 && content.every((b: { type?: unknown; tool_use_id?: unknown; is_error?: unknown } | null) => b?.type === "tool_result" && b.tool_use_id === id && b.is_error === true);
 }
 
 function holdsToolResult(record: Record<string, unknown>, id: string): boolean {
@@ -462,6 +470,7 @@ export class IsolatedForks {
 		let lastKey: string | symbol | undefined;
 		let args: Record<string, unknown> | undefined;
 		let capturedKey: string | symbol | undefined;
+		let capturedCallId: string | undefined;
 		let usageTimer: ReturnType<typeof setTimeout> | undefined;
 		let usageWaited!: () => void;
 		const usageWait = new Promise<void>((resolve) => { usageWaited = resolve; });
@@ -510,9 +519,12 @@ export class IsolatedForks {
 						}
 						continue;
 					}
-					// Past the captured call, only its own response's events are read.
+					// Past the captured call, only its own response's events are read. Claude Code
+					// can refuse the call before that response's final usage arrives, so the refusal
+					// is passed over too; the usage wait still bounds how long this reads.
 					if (args) {
 						if (message.type === "assistant" || message.type === "system") continue;
+						if (capturedCallId !== undefined && onlyRefusalOf(message, capturedCallId)) continue;
 						return;
 					}
 					if (message.type !== "assistant") continue;
@@ -524,7 +536,8 @@ export class IsolatedForks {
 					if (!usageByKey.has(key)) seen(key, body.usage);
 					const captured = firstToolUse(body.content, sdkName);
 					if (captured) {
-						args = captured;
+						args = captured.args;
+						capturedCallId = captured.id;
 						capturedKey = key;
 						// Without the response's stream events its final usage never arrives.
 						if (id === undefined || id !== openId) return;
