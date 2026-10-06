@@ -33,12 +33,15 @@ export interface ForkUsage {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/** True only when the response's final output count (its `message_delta`) and a
+	 *  valid input count were read. False means the totals are unconfirmed; output may understate. */
+	complete: boolean;
 }
 
 export type ForkFailure = "no-capture-tool" | "no-capture" | "unsafe-config" | "unsupported-context" | "stale-context" | "cut-timeout" | "aborted" | "error";
 
 export type ForkResult =
-	| { ok: true; args: Record<string, unknown>; usage: ForkUsage }
+	| { ok: true; args: Record<string, unknown>; usage?: ForkUsage }
 	| { ok: false; reason: ForkFailure; usage?: ForkUsage };
 
 export interface ForkRequest {
@@ -169,18 +172,39 @@ export interface ForkDeps {
 	sdkToolName(piToolName: string): string;
 	deleteSession(sessionId: string, cwd: string): void;
 	debug(...args: unknown[]): void;
+	/** Overrides FORK_USAGE_WAIT_MS. */
+	usageWaitMs?: number;
 }
 
-function usageOf(usage: unknown): ForkUsage | undefined {
-	if (!usage || typeof usage !== "object") return undefined;
-	const raw = usage as Record<string, number | undefined>;
-	return {
-		input: raw.input_tokens ?? 0,
-		output: raw.output_tokens ?? 0,
-		cacheRead: raw.cache_read_input_tokens ?? 0,
-		cacheWrite: raw.cache_creation_input_tokens ?? 0,
-	};
+const USAGE_FIELDS = [
+	["input", "input_tokens"],
+	["output", "output_tokens"],
+	["cacheRead", "cache_read_input_tokens"],
+	["cacheWrite", "cache_creation_input_tokens"],
+] as const;
+
+function count(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
+
+/** A response's usage as reported so far: the counts `usage` carries replace the
+ *  ones in `base` (the API reports running totals, never increments). */
+function usageOf(usage: unknown, base?: ForkUsage): ForkUsage | undefined {
+	if (!usage || typeof usage !== "object") return base;
+	const raw = usage as Record<string, unknown>;
+	const next: ForkUsage = { ...(base ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }), complete: false };
+	let read = false;
+	for (const [field, key] of USAGE_FIELDS) {
+		const value = count(raw[key]);
+		if (value === undefined) continue;
+		next[field] = value;
+		read = true;
+	}
+	return read ? next : base;
+}
+
+/** How long a captured call waits for its response's final usage. */
+export const FORK_USAGE_WAIT_MS = 2_000;
 
 function firstToolUse(content: unknown, sdkName: string): Record<string, unknown> | undefined {
 	if (!Array.isArray(content)) return undefined;
@@ -422,9 +446,33 @@ export class IsolatedForks {
 		let sessionId: string | undefined;
 		let started: ReturnType<ForkDeps["startQuery"]> | undefined;
 		let consumed: Promise<void> | undefined;
-		let usage: ForkUsage | undefined;
+		// Usage per response, keyed by message id, or by the record itself when it
+		// names no response. Stream events carry no id after message_start, so they
+		// belong to the response it opened.
+		const usageByKey = new Map<string | symbol, { usage: ForkUsage; input: boolean }>();
+		const seen = (key: string | symbol, raw: unknown, final = false) => {
+			const known = usageByKey.get(key);
+			const usage = usageOf(raw, known?.usage);
+			if (!usage || usage === known?.usage) return;
+			const input = (known?.input ?? false) || count((raw as { input_tokens?: unknown }).input_tokens) !== undefined;
+			const output = final && count((raw as { output_tokens?: unknown }).output_tokens) !== undefined;
+			usageByKey.set(key, { usage: { ...usage, complete: output && input }, input });
+		};
+		let openId: string | undefined;
+		let lastKey: string | symbol | undefined;
 		let args: Record<string, unknown> | undefined;
-		const withUsage = () => (usage ? { usage } : {});
+		let capturedKey: string | symbol | undefined;
+		let usageTimer: ReturnType<typeof setTimeout> | undefined;
+		let usageWaited!: () => void;
+		const usageWait = new Promise<void>((resolve) => { usageWaited = resolve; });
+		const reported = (): ForkUsage | undefined => {
+			const key = args ? capturedKey : lastKey;
+			return key === undefined ? undefined : usageByKey.get(key)?.usage;
+		};
+		const withUsage = () => {
+			const usage = reported();
+			return usage ? { usage } : {};
+		};
 		try {
 			const resumeAt = await source.forkPoint(controller.signal, request.cutAfterToolResult);
 			if (controller.signal.aborted) return { ok: false, reason: "aborted" };
@@ -443,24 +491,58 @@ export class IsolatedForks {
 						this.deps.debug("isolated-fork: init named a session other than the fork's");
 						throw new ForkRefused("error");
 					}
+					if (message.type === "stream_event") {
+						const event = (message as { event?: { type?: unknown; message?: { id?: unknown; usage?: unknown }; usage?: unknown } }).event;
+						if (event?.type === "message_start") {
+							// Everything of the captured response has been read.
+							if (args) return;
+							openId = typeof event.message?.id === "string" ? event.message.id : undefined;
+							if (openId === undefined) continue;
+							lastKey = openId;
+							seen(openId, event.message?.usage);
+						} else if (event?.type === "message_delta" && openId !== undefined) {
+							// Complete only with the closing output count and a valid input count from any event of the response.
+							seen(openId, event.usage, true);
+							if (args && openId === capturedKey) return;
+						} else if (event?.type === "message_stop") {
+							if (args && openId === capturedKey) return;
+							openId = undefined;
+						}
+						continue;
+					}
+					// Past the captured call, only its own response's events are read.
+					if (args) {
+						if (message.type === "assistant" || message.type === "system") continue;
+						return;
+					}
 					if (message.type !== "assistant") continue;
-					const body = message.message && typeof message.message === "object" ? message.message as { content?: unknown; usage?: unknown } : {};
-					usage ??= usageOf(body.usage);
+					const body = message.message && typeof message.message === "object" ? message.message as { id?: unknown; content?: unknown; usage?: unknown } : {};
+					const id = typeof body.id === "string" ? body.id : openId;
+					const key = id ?? Symbol("unidentified response");
+					lastKey = key;
+					// A record repeats its response's counts so far; the stream's own are never replaced by it.
+					if (!usageByKey.has(key)) seen(key, body.usage);
 					const captured = firstToolUse(body.content, sdkName);
 					if (captured) {
 						args = captured;
-						return;
+						capturedKey = key;
+						// Without the response's stream events its final usage never arrives.
+						if (id === undefined || id !== openId) return;
+						usageTimer = setTimeout(usageWaited, this.deps.usageWaitMs ?? FORK_USAGE_WAIT_MS);
+						usageTimer.unref?.();
 					}
 				}
 			})();
-			await Promise.race([consumed, stopped]);
-			if (args) return { ok: true, args, usage: usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+			// usageWait starts only once a call is captured, so it bounds just that wait.
+			await Promise.race([consumed, usageWait, stopped]);
+			if (args && !controller.signal.aborted) return { ok: true, args, ...withUsage() };
 			return { ok: false, reason: controller.signal.aborted ? "aborted" : "no-capture", ...withUsage() };
 		} catch (error) {
 			if (error instanceof ForkRefused) return { ok: false, reason: error.reason, ...withUsage() };
 			this.deps.debug(`isolated-fork: failed (${errorKind(error)})`);
 			return { ok: false, reason: controller.signal.aborted ? "aborted" : "error", ...withUsage() };
 		} finally {
+			clearTimeout(usageTimer);
 			// The result is known, so stop the process instead of waiting for it.
 			controller.abort();
 			request.signal.removeEventListener("abort", abort);

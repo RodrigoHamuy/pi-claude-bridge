@@ -350,7 +350,7 @@ describe("IsolatedForks", () => {
 		const r = request();
 		forks.handle(r.data);
 		const result = await r.accepted[0];
-		assert.deepEqual(result, { ok: true, args: { startId: "m1", endId: "m2", summary: "s" }, usage: { input: 10, output: 2, cacheRead: 7, cacheWrite: 1 } });
+		assert.deepEqual(result, { ok: true, args: { startId: "m1", endId: "m2", summary: "s" }, usage: { input: 10, output: 2, cacheRead: 7, cacheWrite: 1, complete: false } }, "without stream events the snapshot is all there is, so it is not final");
 		assert.equal(log.started[0].prompt, "NUDGE");
 		assert.equal(log.closed, 1);
 		assert.equal(log.processClosed, 1);
@@ -1010,5 +1010,163 @@ describe("isolated fork through the provider", async () => {
 		assert.equal(existsSync(getSessionPath(forkId, cwd, claudeDir)), false, "deleted once the child exited");
 		assert.ok(sessionExists(main.query.options.resume), "the main session is kept");
 		assert.throws(() => spawner({ command: process.execPath, args: ["-e", ""], cwd, env: process.env, signal: new AbortController().signal }), /closed/);
+	});
+});
+
+describe("IsolatedForks usage", () => {
+	const ev = (event) => ({ type: "stream_event", event });
+	const start = (id, usage) => ev({ type: "message_start", message: { id, usage } });
+	const delta = (usage) => ev({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage });
+	const stop = ev({ type: "message_stop" });
+	const record = (id, content, output = 3) => ({ type: "assistant", message: { id, content, usage: { input_tokens: 50, output_tokens: output, cache_read_input_tokens: 1000, cache_creation_input_tokens: 20 } } });
+	const compress = (input) => ({ type: "tool_use", name: "mcp__custom-tools__compress", input });
+	const startUsage = { input_tokens: 50, output_tokens: 3, cache_read_input_tokens: 1000, cache_creation_input_tokens: 20 };
+	const never = () => gate().wait;
+
+	async function fork(steps, { extra = {}, captureTool = "compress", during } = {}) {
+		const served = new ServedRequests();
+		served.record("pi-a", { id: "m" }, ctxWith("a"), undefined, "/cwd");
+		const pulled = [];
+		const { deps, log } = fakeDeps((abortController, target) => steps(target, pulled, abortController), { usageWaitMs: 2_000, ...extra });
+		const forks = new IsolatedForks(served, deps);
+		const r = request({ captureTool });
+		const began = Date.now();
+		forks.handle(r.data);
+		during?.(r);
+		const result = await r.accepted[0];
+		return { result, ms: Date.now() - began, log, pulled };
+	}
+	const init = (target) => ({ type: "system", subtype: "init", session_id: target.forkSessionId });
+	const after = (pulled, label) => () => { pulled.push(label); };
+
+	it("reports a recorded Claude Code stream's final usage, read no further than its message_delta", async () => {
+		const recorded = readFileSync(new URL("./fixtures/sdk-streams/single-tool.jsonl", import.meta.url), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const at = recorded.findIndex((m) => m.type === "stream_event" && m.event.type === "message_delta");
+		const { result, pulled } = await fork((target, pulled) => recorded.flatMap((m, i) => {
+			const step = m.type === "system" && m.subtype === "init" ? { ...m, session_id: target.forkSessionId } : m;
+			return i === at ? [step, after(pulled, "past message_delta")] : [step];
+		}), { captureTool: "read" });
+		assert.equal(recorded[at].event.usage.output_tokens, 106);
+		assert.equal(recorded.find((m) => m.type === "assistant" && m.message.content.some((b) => b.type === "tool_use")).message.usage.output_tokens, 3, "the captured record itself carries the start count");
+		assert.deepEqual(result, { ok: true, args: { path: "one.txt" }, usage: { input: 10, output: 106, cacheRead: 9410, cacheWrite: 683, complete: true } });
+		assert.deepEqual(pulled, [], "nothing after the response's message_delta is read");
+	});
+
+	it("follows the captured response through thinking, text and parallel tool records, without adding counts", async () => {
+		const { result, pulled } = await fork((target, pulled) => [
+			init(target),
+			start("msg_A", startUsage),
+			record("msg_A", [{ type: "thinking", thinking: "t", signature: "s" }]),
+			record("msg_A", [{ type: "text", text: "picking ranges" }]),
+			record("msg_A", [{ type: "tool_use", name: "mcp__custom-tools__read", input: { path: "x" } }]),
+			record("msg_A", [compress({ startId: "m1" })]),
+			{ type: "system", subtype: "thinking_tokens" },
+			record("msg_A", [compress({ startId: "m9" })]),
+			delta({ input_tokens: 50, output_tokens: 543, cache_read_input_tokens: 1000, cache_creation_input_tokens: 20 }),
+			after(pulled, "past message_delta"),
+			stop,
+		]);
+		assert.deepEqual(result, { ok: true, args: { startId: "m1" }, usage: { input: 50, output: 543, cacheRead: 1000, cacheWrite: 20, complete: true } });
+		assert.deepEqual(pulled, []);
+	});
+
+	it("keeps the start counts a message_delta omits, as the API's output-only delta does", async () => {
+		const { result } = await fork((target) => [init(target), start("msg_A", startUsage), record("msg_A", [compress({ startId: "m1" })]), delta({ output_tokens: 543 }), stop]);
+		assert.deepEqual(result.usage, { input: 50, output: 543, cacheRead: 1000, cacheWrite: 20, complete: true });
+	});
+
+	it("never credits another response's usage to the captured one", async () => {
+		const { result } = await fork((target) => [
+			init(target),
+			start("msg_A", { input_tokens: 5, output_tokens: 1 }),
+			record("msg_A", [{ type: "text", text: "no call" }]),
+			delta({ output_tokens: 99 }),
+			stop,
+			start("msg_B", { input_tokens: 7, output_tokens: 2 }),
+			record("msg_B", [compress({ startId: "m1" })]),
+			delta({ output_tokens: 40 }),
+			stop,
+		]);
+		assert.deepEqual(result.usage, { input: 7, output: 40, cacheRead: 0, cacheWrite: 0, complete: true });
+	});
+
+	it("reports the start counts as partial when the response stops without a final usage", async () => {
+		const { result, ms } = await fork((target) => [init(target), start("msg_A", startUsage), record("msg_A", [compress({ startId: "m1" })]), delta({}), stop]);
+		assert.deepEqual(result, { ok: true, args: { startId: "m1" }, usage: { input: 50, output: 3, cacheRead: 1000, cacheWrite: 20, complete: false } });
+		assert.ok(ms < 1_000, `message_stop ends the wait (${ms} ms)`);
+	});
+
+	it("ignores counts that are not finite and non-negative", async () => {
+		for (const bad of [{ output_tokens: -1 }, { output_tokens: Number.NaN }, { output_tokens: "543" }]) {
+			const { result } = await fork((target) => [init(target), start("msg_A", { ...startUsage, cache_read_input_tokens: -5 }), record("msg_A", [compress({ startId: "m1" })]), delta(bad), stop]);
+			assert.deepEqual(result.usage, { input: 50, output: 3, cacheRead: 0, cacheWrite: 20, complete: false }, JSON.stringify(bad));
+		}
+	});
+
+	it("waits a bounded time for a final usage that never comes, then stops the fork", async () => {
+		const never = gate();
+		const { result, ms, log, pulled } = await fork((target, pulled) => [init(target), start("msg_A", startUsage), record("msg_A", [compress({ startId: "m1" })]), never.wait, after(pulled, "after hang")], { extra: { usageWaitMs: 60 } });
+		assert.deepEqual(result, { ok: true, args: { startId: "m1" }, usage: { input: 50, output: 3, cacheRead: 1000, cacheWrite: 20, complete: false } });
+		assert.ok(ms >= 50 && ms < 1_500, `bounded by usageWaitMs (${ms} ms)`);
+		assert.equal(log.closed, 1);
+		assert.equal(log.processClosed, 1);
+		assert.ok(log.started[0].abortController.signal.aborted, "the fork's query is aborted");
+		assert.deepEqual(pulled, []);
+	});
+
+	it("stops waiting for usage when the caller aborts, and reports the fork aborted with partial usage", async () => {
+		const never = gate();
+		const { result, ms, log } = await fork((target) => [init(target), start("msg_A", startUsage), record("msg_A", [compress({ startId: "m1" })]), never.wait], {
+			during: (r) => setTimeout(() => r.controller.abort(), 30),
+		});
+		assert.deepEqual(result, { ok: false, reason: "aborted", usage: { input: 50, output: 3, cacheRead: 1000, cacheWrite: 20, complete: false } });
+		assert.ok(ms < 1_500, `${ms} ms`);
+		assert.equal(log.processClosed, 1);
+	});
+
+	it("is complete only with a valid input count from the response itself", async () => {
+		const bare = (record) => ({ type: "assistant", message: { id: record.message.id, content: record.message.content } });
+		const capture = bare(record("msg_A", [compress({ startId: "m1" })]));
+		for (const [label, startCounts] of [["cache only", { cache_read_input_tokens: 1000, output_tokens: 3 }], ["NaN input", { input_tokens: Number.NaN, output_tokens: 3 }], ["negative input", { input_tokens: -4, output_tokens: 3 }]]) {
+			const { result } = await fork((target) => [init(target), start("msg_A", startCounts), capture, delta({ output_tokens: 543 }), stop]);
+			assert.equal(result.usage.complete, false, label);
+			assert.equal(result.usage.output, 543, label);
+		}
+		const { result } = await fork((target) => [init(target), start("msg_A", { cache_read_input_tokens: 1000 }), capture, delta({ input_tokens: 50, output_tokens: 543 }), stop]);
+		assert.deepEqual(result.usage, { input: 50, output: 543, cacheRead: 1000, cacheWrite: 0, complete: true }, "a final event's own valid input completes it");
+	});
+
+	it("never credits an earlier response's usage to a captured one that reported none", async () => {
+		const unidentified = { type: "assistant", message: { content: [{ type: "text", text: "earlier" }], usage: startUsage } };
+		const capture = { type: "assistant", message: { id: "msg_B", content: [compress({ startId: "m1" })] } };
+		const none = await fork((target) => [init(target), unidentified, start("msg_B", {}), capture, delta({}), stop]);
+		assert.deepEqual(none.result, { ok: true, args: { startId: "m1" } });
+		const partial = await fork((target) => [init(target), unidentified, start("msg_B", { input_tokens: 7, output_tokens: 2 }), capture, never()], { extra: { usageWaitMs: 50 } });
+		assert.deepEqual(partial.result.usage, { input: 7, output: 2, cacheRead: 0, cacheWrite: 0, complete: false });
+		const anonymous = await fork((target) => [init(target), unidentified, { type: "assistant", message: { content: [compress({ startId: "m1" })] } }]);
+		assert.deepEqual(anonymous.result, { ok: true, args: { startId: "m1" } }, "an unidentified capture gets only its own record's usage");
+	});
+
+	it("takes a captured record's own usage as partial, and lets the final event replace it", async () => {
+		const { result } = await fork((target) => [init(target), start("msg_B", {}), record("msg_B", [compress({ startId: "m1" })]), delta({ output_tokens: 543 }), stop]);
+		assert.deepEqual(result.usage, { input: 50, output: 543, cacheRead: 1000, cacheWrite: 20, complete: true });
+	});
+
+	it("leaves usage out instead of reporting zeros when the stream carried none", async () => {
+		const { result } = await fork((target) => [init(target), { type: "assistant", message: { id: "msg_A", content: [compress({ startId: "m1" })] } }]);
+		assert.deepEqual(result, { ok: true, args: { startId: "m1" } });
+	});
+
+	it("stops at anything but the captured response's own records, such as the refused tool's result", async () => {
+		const { result, pulled } = await fork((target, pulled) => [
+			init(target),
+			start("msg_A", startUsage),
+			record("msg_A", [compress({ startId: "m1" })]),
+			{ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "refused" }] } },
+			after(pulled, "past the tool result"),
+			delta({ output_tokens: 543 }),
+		]);
+		assert.equal(result.usage.complete, false);
+		assert.deepEqual(pulled, []);
 	});
 });
