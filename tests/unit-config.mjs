@@ -13,9 +13,7 @@ function withTempHome(fn) {
 	const home = mkdtempSync(join(tmpdir(), "claude-bridge-home-"));
 	try {
 		process.env.HOME = home;
-		// Pi exports this override when launching tools. Do not let it bypass
-		// the temporary HOME and send fixture writes into the user's config.
-		delete process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = join(home, "agent");
 		return fn(home);
 	} finally {
 		if (oldHome === undefined) delete process.env.HOME;
